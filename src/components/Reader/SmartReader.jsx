@@ -117,19 +117,22 @@ function createCustomRenderers(errorTags, currentHeaders) {
       return <p className="my-3 leading-7 dark:text-surface-300" {...props}>{children}</p>;
     },
 
-    // 标题 —— 跟踪当前 section 层级
+    // 标题 —— 跟踪当前 section 层级（同步到 store 供 AI 解释使用）
     h1({ children, ...props }) {
       currentHeaders.current = [String(children).toLowerCase()];
+      useAppStore.getState().setCurrentHeaders(currentHeaders.current);
       return <h1 className="dark:text-surface-100 dark:border-surface-700" {...props}>{children}</h1>;
     },
     h2({ children, ...props }) {
       const prev = currentHeaders.current || [];
       currentHeaders.current = [...prev.slice(0, 1), String(children).toLowerCase()];
+      useAppStore.getState().setCurrentHeaders(currentHeaders.current);
       return <h2 className="dark:text-surface-100" {...props}>{children}</h2>;
     },
     h3({ children, ...props }) {
       const prev = currentHeaders.current || [];
       currentHeaders.current = [...prev.slice(0, 2), String(children).toLowerCase()];
+      useAppStore.getState().setCurrentHeaders(currentHeaders.current);
       return <h3 className="dark:text-surface-200" {...props}>{children}</h3>;
     },
 
@@ -197,7 +200,31 @@ export default function SmartReader() {
   const errorTags = useAppStore((s) => s.errorTags);
   const containerRef = React.useRef(null);
 
-  const content = activeFile ? mockMarkdownContent[activeFile.path] : null;
+  // 文档内容：优先从后端拉取，失败时降级到 mock
+  const [content, setContent] = React.useState(null);
+  const [loading, setLoading] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!activeFile) {
+      setContent(null);
+      return;
+    }
+    // 先用 mock 内容快速渲染，避免白屏
+    setContent(mockMarkdownContent[activeFile.path] || null);
+    setLoading(true);
+    fetch(`/api/documents/content?path=${encodeURIComponent(activeFile.path)}`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((data) => {
+        if (data.content) setContent(data.content);
+      })
+      .catch(() => {
+        // 请求失败时保留已设置的 mock 内容，静默降级
+      })
+      .finally(() => setLoading(false));
+  }, [activeFile?.path]);
 
   const currentHeaders = useRef([]);
 

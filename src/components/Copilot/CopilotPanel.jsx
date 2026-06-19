@@ -3,20 +3,15 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Bot, User, Loader2 } from 'lucide-react';
 import useAppStore from '../../store/useAppStore';
-import { mockAIStreamResponse, mockAIExplanation } from '../../data/mockData';
+import { streamFetch } from '../../utils/streamFetch';
 
 /**
  * ChatMessage —— 单条对话气泡
  */
-function ChatMessage({ message }) {
+function ChatMessage({ message, isLast }) {
   const isUser = message.role === 'user';
   const isStreaming = useAppStore((s) => s.isStreaming);
-  const isLastAssistant =
-    !isUser &&
-    message ===
-      useAppStore.getState().chatMessages[
-        useAppStore.getState().chatMessages.length - 1
-      ];
+  const isLastAssistant = !isUser && isLast;
 
   return (
     <div className={`flex gap-3 ${isUser ? 'flex-row-reverse' : ''}`}>
@@ -88,6 +83,7 @@ function EmptyCopilot() {
 export default function CopilotPanel() {
   const chatMessages = useAppStore((s) => s.chatMessages);
   const isStreaming = useAppStore((s) => s.isStreaming);
+  const activeFile = useAppStore((s) => s.activeFile);
   const addChatMessage = useAppStore((s) => s.addChatMessage);
   const setStreaming = useAppStore((s) => s.setStreaming);
   const clearChat = useAppStore((s) => s.clearChat);
@@ -107,9 +103,14 @@ export default function CopilotPanel() {
     setInput('');
     setStreaming(true);
 
+    // 发起真实 SSE 请求 — 自由对话接口
     let accumulated = '';
-    mockAIStreamResponse(
-      mockAIExplanation,
+    streamFetch(
+      '/api/copilot/chat',
+      {
+        message: text,
+        file_path: activeFile?.path || '',
+      },
       (chunk) => {
         accumulated += chunk;
         const store = useAppStore.getState();
@@ -122,7 +123,15 @@ export default function CopilotPanel() {
         }
         useAppStore.setState({ chatMessages: msgs });
       },
-      () => setStreaming(false)
+      (error) => {
+        if (error) {
+          const store = useAppStore.getState();
+          const msgs = [...store.chatMessages];
+          msgs.push({ role: 'assistant', content: `❌ ${error}` });
+          useAppStore.setState({ chatMessages: msgs });
+        }
+        setStreaming(false);
+      }
     );
   };
 
@@ -163,7 +172,7 @@ export default function CopilotPanel() {
         ) : (
           <>
             {chatMessages.map((msg, i) => (
-              <ChatMessage key={i} message={msg} />
+              <ChatMessage key={i} message={msg} isLast={i === chatMessages.length - 1} />
             ))}
             <div ref={messagesEndRef} />
           </>

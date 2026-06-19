@@ -11,6 +11,16 @@ import useAppStore from '../../store/useAppStore';
 import { mockFileTree } from '../../data/mockData';
 
 /**
+ * 将后端返回的文件树节点格式标准化为前端所需格式
+ */
+function normalizeTree(nodes) {
+  return nodes.map((node) => ({
+    ...node,
+    children: node.children ? normalizeTree(node.children) : undefined,
+  }));
+}
+
+/**
  * FileTreeNode - 递归渲染文件树节点
  */
 function FileTreeNode({ node, depth = 0 }) {
@@ -78,6 +88,23 @@ function FileTreeNode({ node, depth = 0 }) {
 export default function LeftSidebar() {
   const collapsed = useAppStore((s) => s.leftSidebarCollapsed);
   const toggleLeftSidebar = useAppStore((s) => s.toggleLeftSidebar);
+  const [fileTree, setFileTree] = React.useState(mockFileTree);
+
+  React.useEffect(() => {
+    fetch('/api/documents')
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((data) => {
+        if (Array.isArray(data) && data.length > 0) {
+          setFileTree(normalizeTree(data));
+        }
+      })
+      .catch(() => {
+        // 请求失败时保留 mock 数据，静默降级
+      });
+  }, []);
 
   if (collapsed) {
     return (
@@ -117,7 +144,7 @@ export default function LeftSidebar() {
 
       {/* File Tree */}
       <div className="flex-1 overflow-y-auto py-2">
-        {mockFileTree.map((node) => (
+        {fileTree.map((node) => (
           <FileTreeNode key={node.id} node={node} />
         ))}
       </div>

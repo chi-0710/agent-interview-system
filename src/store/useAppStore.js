@@ -60,6 +60,11 @@ const useAppStore = create((set, get) => ({
   setSelection: (sel) => set({ selection: sel }),
   clearSelection: () => set({ selection: null }),
 
+  // ========== 阅读器标题追踪（供 AI 解释使用）==========
+  /** @type {string[]} */
+  currentHeaders: [],
+  setCurrentHeaders: (headers) => set({ currentHeaders: headers }),
+
   // ========== AI 对话 ==========
   /** @type {{ role: 'user' | 'assistant'; content: string }[]} */
   chatMessages: [],

@@ -1,17 +1,16 @@
 import React from 'react';
 import { Sparkles } from 'lucide-react';
 import useAppStore from '../../store/useAppStore';
-import { mockAIStreamResponse, mockAIExplanation } from '../../data/mockData';
+import { streamFetch } from '../../utils/streamFetch';
+
 
 /**
  * AIBubble —— 选中文字后弹出的浮动 AI 按钮
- *
- * 功能：
- * - 根据 selection 坐标定位
- * - 点击触发右侧抽屉打开，发起 AI 解释
  */
 export default function AIBubble() {
   const selection = useAppStore((s) => s.selection);
+  const activeFile = useAppStore((s) => s.activeFile);
+  const currentHeaders = useAppStore((s) => s.currentHeaders);
   const openRightDrawer = useAppStore((s) => s.openRightDrawer);
   const addChatMessage = useAppStore((s) => s.addChatMessage);
   const setStreaming = useAppStore((s) => s.setStreaming);
@@ -19,7 +18,6 @@ export default function AIBubble() {
 
   const [position, setPosition] = React.useState({ x: 0, y: 0 });
 
-  // 节流更新位置（避免频繁重渲染）
   React.useEffect(() => {
     if (selection) {
       setPosition({ x: selection.x, y: selection.y });
@@ -30,21 +28,28 @@ export default function AIBubble() {
     e.stopPropagation();
     if (isStreaming) return;
 
+    const selectedText = selection.fullText || selection.text;
+    const filePath = activeFile?.path || '';
+
     const userMsg = {
       role: 'user',
-      content: `请解释以下内容：\n\n> ${selection.fullText || selection.text}`,
+      content: `请解释以下内容：\n\n> ${selectedText}`,
     };
     addChatMessage(userMsg);
     openRightDrawer();
     setStreaming(true);
 
-    // 模拟流式响应
+    // 发起真实 SSE 请求
     let accumulated = '';
-    mockAIStreamResponse(
-      mockAIExplanation,
+    streamFetch(
+      '/api/copilot/explain',
+      {
+        selected_text: selectedText,
+        file_path: filePath,
+        headers: currentHeaders || [],
+      },
       (chunk) => {
         accumulated += chunk;
-        // 更新最后一条消息
         const store = useAppStore.getState();
         const msgs = [...store.chatMessages];
         const lastMsg = msgs[msgs.length - 1];
@@ -55,7 +60,13 @@ export default function AIBubble() {
         }
         useAppStore.setState({ chatMessages: msgs });
       },
-      () => {
+      (error) => {
+        if (error) {
+          const store = useAppStore.getState();
+          const msgs = [...store.chatMessages];
+          msgs.push({ role: 'assistant', content: `❌ ${error}` });
+          useAppStore.setState({ chatMessages: msgs });
+        }
         setStreaming(false);
       }
     );
