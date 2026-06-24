@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     # Docs
     docs_dir: str = ""
 
+    # CORS
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+
     # App
     app_name: str = "Agent Interview System"
     debug: bool = True

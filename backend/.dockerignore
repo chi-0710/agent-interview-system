@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env
+venv
+.venv
+pip-wheel-metadata
+.git
+.gitignore
+*.md
+.env
+chroma_data
+.DS_Store

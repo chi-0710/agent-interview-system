@@ -16,8 +16,12 @@ if config.config_file_name is not None:
 
 # 导入所有模型，确保 Base.metadata 包含所有表
 from app.models import Base  # noqa: E402
+from app.config import get_settings  # noqa: E402
 
 target_metadata = Base.metadata
+
+settings = get_settings()
+config.set_main_option("sqlalchemy.url", settings.database_url)
 
 
 def run_migrations_offline() -> None:
