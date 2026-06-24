@@ -96,8 +96,13 @@ function createCustomRenderers(errorTags, currentHeaders) {
                 .join('')
             : '';
 
+      // 生成 section 路径标识（确定性，用于精准高亮）
+      const sectionPath = currentHeaders.current
+        ? currentHeaders.current.join(' > ')
+        : '';
+
       const { matched, tags } = matchErrorTags(
-        { headers: currentHeaders.current },
+        { headers: currentHeaders.current, sectionPath },
         errorTags
       );
 
@@ -107,6 +112,7 @@ function createCustomRenderers(errorTags, currentHeaders) {
             className="error-hotspot"
             title={`错题标签: ${tags.join(', ')}`}
             data-error-tags={tags.join(',')}
+            data-section-id={sectionPath}
             {...props}
           >
             {children}
@@ -114,7 +120,15 @@ function createCustomRenderers(errorTags, currentHeaders) {
         );
       }
 
-      return <p className="my-3 leading-7 dark:text-surface-300" {...props}>{children}</p>;
+      return (
+        <p
+          className="my-3 leading-7 dark:text-surface-300"
+          data-section-id={sectionPath}
+          {...props}
+        >
+          {children}
+        </p>
+      );
     },
 
     // 标题 —— 跟踪当前 section 层级（同步到 store 供 AI 解释使用）

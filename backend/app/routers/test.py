@@ -16,6 +16,7 @@ from sqlalchemy import select
 from app.database import get_db
 from app.models import TestSession, TestAnswer, Question
 from app.services.evaluator import evaluate_answer as evaluate_single
+from app.services.evaluator import evaluate_code_answer
 from app.services.error_tags import aggregate_error_tags
 from app.services.llm import chat as llm_chat
 
@@ -221,13 +222,28 @@ async def submit_test(req: SubmitRequest) -> dict:
             continue
         answer_map.append((ans, q))
         # 有 LLM 就走 LLM，否则规则判分
-        eval_tasks.append(
-            evaluate_single(
-                question=q["content"],
-                answer=q.get("expected_answer", ""),
-                user_answer=ans.user_answer,
-            ) if used_db else None  # 标记：需要规则判分
-        )
+        if used_db:
+            q_type = q.get("type", "text")
+            if q_type == "code":
+                # 代码题走混合评判：物理执行 + LLM 错因
+                eval_tasks.append(
+                    evaluate_code_answer(
+                        question=q["content"],
+                        user_code=ans.user_answer,
+                        question_id=ans.question_id,
+                    )
+                )
+            else:
+                # 文字/选择题走 LLM 评判
+                eval_tasks.append(
+                    evaluate_single(
+                        question=q["content"],
+                        answer=q.get("expected_answer", ""),
+                        user_answer=ans.user_answer,
+                    )
+                )
+        else:
+            eval_tasks.append(None)  # 标记：需要规则判分
 
     if not eval_tasks:
         raise HTTPException(status_code=400, detail="没有可评判的题目")

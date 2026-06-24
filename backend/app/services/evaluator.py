@@ -1,6 +1,10 @@
 """
 单题评判逻辑
 
+策略升级：
+- 文字题/选择题：LLM 评判 + JSON 解析
+- 代码题：优先物理执行（subprocess/Docker），LLM 只做"助教"——基于执行结果生成错因解释
+
 拼 prompt → 调用 LLM → 解析 JSON → 重试容错
 """
 import json
@@ -188,3 +192,149 @@ async def evaluate_answer(
         "explanation": f"AI 评判异常（{last_error[:80]}），请人工复核",
         "error_tags": ["评判异常"],
     }
+
+
+CODE_EXPLAIN_SYSTEM_PROMPT = """你是一个技术面试辅导助手。用户的代码已经通过测试用例执行，你需要基于执行结果给出易懂的错因分析。
+
+返回格式（严格 JSON）：
+{
+  "explanation": "用通俗的语言说明错误原因和改进建议（100字以内）",
+  "error_type": "语法错误 | 逻辑错误 | 边界问题 | 性能问题 | null"
+}
+
+规则：
+1. 只能基于提供的执行结果和测试用例进行分析，不要编造
+2. explanation 必须用中文，通俗易懂，控制在 100 字以内
+3. error_type：错误时填类型，正确时填 null
+4. 只返回 JSON，不要加任何其他内容"""
+
+
+async def evaluate_code_answer(
+    question: str,
+    user_code: str,
+    test_cases: list = None,
+    question_id: str = None,
+) -> dict:
+    """
+    代码题混合评判：物理执行 + LLM 错因解释。
+
+    流程：
+    1. 先在沙箱中执行代码（注入测试用例）
+    2. 用通过率计算分数（确定性）
+    3. LLM 基于执行结果生成错因解释（助教角色，不再是裁判）
+
+    Args:
+        question: 题目内容
+        user_code: 用户提交的代码
+        test_cases: 测试用例列表
+        question_id: 题目 ID（用于查找预设测试用例）
+
+    Returns:
+        {
+            "correct": bool,
+            "score": float,
+            "error_type": Optional[str],
+            "explanation": str,
+            "error_tags": list[str],
+            "execution": { ... }  # 执行结果详情
+        }
+    """
+    # 1. 物理执行代码
+    execution_result = None
+    try:
+        from app.services.code_executor import execute_code, get_test_cases_for_question
+
+        # 如果没传测试用例，尝试从题目预设中获取
+        if not test_cases and question_id:
+            test_cases = get_test_cases_for_question(question_id)
+
+        if test_cases:
+            execution_result = execute_code(
+                code=user_code,
+                language="python",
+                test_cases=test_cases,
+                timeout=5.0,
+            )
+            logger.info(
+                f"[evaluator/code] execution: "
+                f"{execution_result.get('pass_count', 0)}/"
+                f"{execution_result.get('total_tests', 0)} passed"
+            )
+        else:
+            logger.warning(f"[evaluator/code] no test cases for question {question_id}, falling back to LLM-only")
+    except Exception as e:
+        logger.error(f"[evaluator/code] execution failed: {e}")
+        execution_result = None
+
+    # 2. 计算分数（确定性）
+    if execution_result and execution_result.get("total_tests", 0) > 0:
+        total = execution_result["total_tests"]
+        passed = execution_result["pass_count"]
+        score = int((passed / total) * 100)
+        correct = passed == total
+
+        # 3. LLM 生成错因解释（助教角色）
+        try:
+            # 构造执行结果摘要
+            exec_summary = f"通过率：{passed}/{total}\n"
+            if execution_result.get("stderr"):
+                exec_summary += f"报错信息：{execution_result['stderr'][:300]}\n"
+            for i, tr in enumerate(execution_result.get("test_results", [])):
+                if not tr.get("passed"):
+                    exec_summary += (
+                        f"失败用例{i+1}：{tr.get('name', '')}\n"
+                        f"  输入：{tr.get('input', '')}\n"
+                        f"  期望：{tr.get('expected', '')}\n"
+                        f"  实际：{tr.get('actual', '')}\n"
+                    )
+
+            user_prompt = f"""题目：{question[:200]}
+
+用户代码：
+```python
+{user_code[:1000]}
+```
+
+执行结果：
+{exec_summary[:500]}
+
+请分析用户代码的问题，给出易懂的解释。"""
+
+            response = await llm_chat(
+                messages=[
+                    {"role": "system", "content": CODE_EXPLAIN_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=300,
+            )
+
+            parsed = _parse_json_response(response)
+            if parsed:
+                explanation = parsed.get("explanation", "")
+                error_type = parsed.get("error_type") if not correct else None
+            else:
+                explanation = f"代码执行结果：{passed}/{total} 个测试用例通过。"
+                error_type = "逻辑错误" if not correct else None
+
+        except Exception as e:
+            logger.warning(f"[evaluator/code] LLM explain failed: {e}")
+            explanation = f"代码执行结果：{passed}/{total} 个测试用例通过。"
+            error_type = "执行错误" if not correct else None
+
+        return {
+            "correct": correct,
+            "score": score,
+            "error_type": error_type,
+            "explanation": explanation,
+            "error_tags": [],
+            "execution": execution_result,
+        }
+
+    # Fallback：没有测试用例或执行失败，走普通 LLM 评判
+    logger.warning("[evaluator/code] falling back to LLM-only evaluation")
+    return await evaluate_answer(
+        question=question,
+        answer="",
+        user_answer=user_code,
+    )

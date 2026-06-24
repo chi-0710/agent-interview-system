@@ -2,8 +2,9 @@
 LLM 客户端封装
 
 统一接口：支持 OpenAI-compatible API 的 stream / 非 stream 调用。
+支持 response_format 强制 JSON 输出。
 """
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Optional, Union
 
 from openai import AsyncOpenAI
 
@@ -62,16 +63,24 @@ async def chat(
     model: Optional[str] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    response_format: Optional[dict] = None,
 ) -> str:
     """
     非流式对话，返回完整响应。
+
+    Args:
+        response_format: 如 {"type": "json_object"} 强制 JSON 输出
     """
     client = _get_client()
-    response = await client.chat.completions.create(
+    kwargs = dict(
         model=model or settings.llm_model,
         messages=messages,
         temperature=temperature if temperature is not None else settings.llm_temperature,
         max_tokens=max_tokens or settings.llm_max_tokens,
         stream=False,
     )
+    if response_format:
+        kwargs["response_format"] = response_format
+
+    response = await client.chat.completions.create(**kwargs)
     return response.choices[0].message.content or ""

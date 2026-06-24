@@ -25,6 +25,7 @@ class ExplainRequest(BaseModel):
     selected_text: str
     file_path: str
     headers: list[str] = []
+    block_context: Optional[str] = None  # 新增：前端提取的完整段落上下文
 
     @field_validator("selected_text")
     @classmethod
@@ -44,6 +45,7 @@ class ExplainRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     file_path: Optional[str] = None
+    session_id: Optional[str] = None  # 新增：会话 ID，用于记忆管理
 
     @field_validator("message")
     @classmethod
@@ -139,6 +141,7 @@ async def explain(request: ExplainRequest):
                 selected_text=request.selected_text,
                 file_path=request.file_path,
                 headers=request.headers,
+                block_context=request.block_context,  # 新增：前端提取的段落上下文
             ):
                 yield await _sse_event("chunk", token)
             yield await _sse_event("done")
@@ -177,7 +180,7 @@ async def copilot_chat(request: ChatRequest):
     自由对话（SSE 流式）
 
     请求体：
-        {"message": "什么是 Belady 异常？", "file_path": "/docs/cs/os-memory.md"}
+        {"message": "什么是 Belady 异常？", "file_path": "/docs/cs/os-memory.md", "session_id": "可选"}
     """
 
     async def event_generator():
@@ -185,6 +188,7 @@ async def copilot_chat(request: ChatRequest):
             async for token in chat_stream(
                 user_message=request.message,
                 file_path=request.file_path,
+                session_id=request.session_id,
             ):
                 yield await _sse_event("chunk", token)
             yield await _sse_event("done")
@@ -202,6 +206,57 @@ async def copilot_chat(request: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ---- 会话管理 ----
+
+class CreateSessionRequest(BaseModel):
+    file_path: Optional[str] = None
+
+
+@router.post("/session")
+async def create_session(req: CreateSessionRequest = None):
+    """创建新会话，返回 session_id"""
+    from app.services.session_manager import get_session_manager
+    mgr = get_session_manager()
+    file_path = req.file_path if req else None
+    session_id = mgr.create_session(file_path=file_path)
+    return {"session_id": session_id}
+
+
+@router.get("/session/{session_id}")
+async def get_session(session_id: str):
+    """获取会话状态和历史消息"""
+    from app.services.session_manager import get_session_manager
+    mgr = get_session_manager()
+    session = mgr.get_session(session_id)
+    if not session:
+        return {"error": "session not found"}
+    return {
+        "session_id": session.session_id,
+        "file_path": session.file_path,
+        "messages": [m.to_dict() for m in session.messages],
+        "summary": session.summary,
+        "message_count": len(session.messages),
+    }
+
+
+@router.delete("/session/{session_id}")
+async def delete_session(session_id: str):
+    """删除会话"""
+    from app.services.session_manager import get_session_manager
+    mgr = get_session_manager()
+    ok = mgr.delete_session(session_id)
+    return {"deleted": ok}
+
+
+@router.post("/session/{session_id}/clear")
+async def clear_session(session_id: str):
+    """清空会话消息"""
+    from app.services.session_manager import get_session_manager
+    mgr = get_session_manager()
+    ok = mgr.clear_session(session_id)
+    return {"cleared": ok}
 
 
 # ---- 保留旧 stub（兼容） ----

@@ -1,12 +1,13 @@
 """
 伴读业务逻辑层
 
-1. 用 selected_text 做向量相似搜索，取 top_k 个 chunks
-2. 过滤：只取 file_path 与请求一致的 chunks
+策略升级：
+1. 优先使用前端传来的 block_context（精准段落）
+2. 若无 block_context，则用 selected_text 做向量相似搜索
 3. 拼 prompt → 调用 LLM stream
 """
 import logging
-from typing import AsyncIterator, List
+from typing import AsyncIterator, List, Optional
 
 from app.services.llm import stream_chat
 
@@ -19,7 +20,7 @@ def _retrieve_context(
     top_k: int = 3,
 ) -> List[dict]:
     """
-    检索相关上下文 chunks。
+    检索相关上下文 chunks（fallback 策略）。
 
     1. 语义搜索取 top_k
     2. 按 file_path 过滤
@@ -52,24 +53,20 @@ def _retrieve_context(
 
 def _build_explain_prompt(
     selected_text: str,
-    chunks: List[dict],
+    context_text: str,
     headers: List[str] = None,
 ) -> tuple[str, list[dict]]:
     """
     构建解释 prompt。
 
+    Args:
+        selected_text: 用户选中的文本
+        context_text: 上下文文本（来自 block_context 或向量检索）
+        headers: 当前阅读位置的标题层级
+
     Returns:
         (system_prompt, messages)
     """
-    # 拼接上下文
-    context_parts = []
-    for i, chunk in enumerate(chunks):
-        chunk_headers = chunk["metadata"].get("headers", [])
-        header_str = " > ".join(chunk_headers) if chunk_headers else "文档片段"
-        context_parts.append(f"--- 资料片段 {i+1}（{header_str}）---\n{chunk['text']}")
-
-    context_text = "\n\n".join(context_parts)
-
     header_hint = ""
     if headers and len(headers) > 0:
         header_hint = f"（用户当前阅读位置：{' > '.join(headers)}）\n"
@@ -101,6 +98,7 @@ async def explain_stream(
     selected_text: str,
     file_path: str,
     headers: List[str] = None,
+    block_context: Optional[str] = None,
     top_k: int = 3,
 ) -> AsyncIterator[str]:
     """
@@ -110,7 +108,8 @@ async def explain_stream(
         selected_text: 用户选中的文本
         file_path: 当前文档路径
         headers: 当前阅读位置的标题层级
-        top_k: 检索的 chunk 数量
+        block_context: 前端提取的完整段落上下文（优先使用）
+        top_k: 向量检索的 chunk 数量（fallback 时使用）
 
     Yields:
         str: 逐 token 文本
@@ -119,13 +118,31 @@ async def explain_stream(
         yield "请选中有效的文字内容。"
         return
 
-    # 1. 检索
-    chunks = _retrieve_context(selected_text, file_path, top_k=top_k)
+    # 策略：优先使用 block_context，否则向量检索
+    context_text = ""
+    if block_context and block_context.strip():
+        # 前端已精准提取段落，直接使用
+        context_text = block_context.strip()
+        logger.info(f"[copilot] using block_context: {len(context_text)} chars")
+    else:
+        # fallback：向量检索
+        chunks = _retrieve_context(selected_text, file_path, top_k=top_k)
+        if chunks:
+            parts = []
+            for i, chunk in enumerate(chunks):
+                chunk_headers = chunk["metadata"].get("headers", [])
+                header_str = " > ".join(chunk_headers) if chunk_headers else "文档片段"
+                parts.append(f"--- 资料片段 {i+1}（{header_str}）---\n{chunk['text']}")
+            context_text = "\n\n".join(parts)
+            logger.info(f"[copilot] using vector retrieval: {len(chunks)} chunks")
 
-    # 2. 拼 prompt
-    messages = _build_explain_prompt(selected_text, chunks, headers)
+    if not context_text:
+        yield "未找到相关上下文，无法提供解释。"
+        return
 
-    # 3. 调用 LLM stream
+    # 拼 prompt → 调用 LLM
+    messages = _build_explain_prompt(selected_text, context_text, headers)
+
     async for token in stream_chat(messages):
         yield token
 
@@ -134,14 +151,20 @@ async def chat_stream(
     user_message: str,
     file_path: str = None,
     top_k: int = 3,
+    session_id: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """
     自由对话（用户在 CopilotPanel 输入框中的提问）。
+
+    支持会话记忆：
+    - 如果提供 session_id，会从会话管理器读取历史上下文
+    - 自动将新消息写入会话
 
     Args:
         user_message: 用户输入
         file_path: 当前文档路径（用于检索上下文）
         top_k: 检索的 chunk 数量
+        session_id: 会话 ID（用于记忆管理）
     """
     if not user_message or not user_message.strip():
         yield "请输入有效的问题。"
@@ -172,10 +195,36 @@ async def chat_stream(
     else:
         system_prompt += "（当前没有可用的学习资料）"
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]
+    # 构建消息列表
+    messages = [{"role": "system", "content": system_prompt}]
 
+    # 如果有会话，读取历史上下文
+    if session_id:
+        from app.services.session_manager import get_session_manager
+        mgr = get_session_manager()
+        session = mgr.get_session(session_id)
+        if session:
+            # 将历史消息拼接到 system prompt 之后
+            history = session.get_context_messages()
+            # 过滤掉 system 消息（我们已经有自己的 system prompt）
+            history = [m for m in history if m.get("role") != "system"]
+            messages.extend(history)
+            # 记录用户消息
+            mgr.add_user_message(session_id, user_message, file_path=file_path)
+
+    messages.append({"role": "user", "content": user_message})
+
+    # 流式输出
+    full_response = ""
     async for token in stream_chat(messages):
+        full_response += token
         yield token
+
+    # 记录助手回复到会话
+    if session_id and full_response:
+        try:
+            from app.services.session_manager import get_session_manager
+            mgr = get_session_manager()
+            mgr.add_assistant_message(session_id, full_response)
+        except Exception as e:
+            logger.warning(f"[copilot] failed to save assistant message: {e}")

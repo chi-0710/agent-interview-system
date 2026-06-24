@@ -30,6 +30,7 @@ export default function AIBubble() {
 
     const selectedText = selection.fullText || selection.text;
     const filePath = activeFile?.path || '';
+    const blockContext = selection.blockContext || null; // 新增：完整段落上下文
 
     const userMsg = {
       role: 'user',
@@ -47,6 +48,7 @@ export default function AIBubble() {
         selected_text: selectedText,
         file_path: filePath,
         headers: currentHeaders || [],
+        block_context: blockContext, // 新增：完整段落上下文
       },
       (chunk) => {
         accumulated += chunk;
