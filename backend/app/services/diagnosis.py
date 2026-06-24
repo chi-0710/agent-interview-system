@@ -190,6 +190,12 @@ class DiagnosisService:
         score = evaluation.get("score", 0)
         error_type_raw = evaluation.get("error_type") or ""
         explanation = evaluation.get("explanation", "")
+        user_answer = evaluation.get("user_answer", "")
+
+        # Step 0: 先尝试匹配错误模式（用于后续步骤）
+        matched_pattern = None
+        if common_mistakes and user_answer:
+            matched_pattern = self._match_error_pattern(common_mistakes, user_answer.lower())
 
         # Step 1: 识别错误类别
         error_category = self._classify_error_category(
@@ -198,15 +204,18 @@ class DiagnosisService:
             error_type_raw=error_type_raw,
             explanation=explanation,
             common_mistakes=common_mistakes,
-            user_answer=evaluation.get("user_answer", ""),
+            user_answer=user_answer,
         )
 
         # Step 2: 定位薄弱知识点
-        weak_kp_ids = self._identify_weak_kps(kps, error_category)
+        # 如果匹配到了错误模式，优先使用模式中的 target_kp_ids
+        weak_kp_ids = self._identify_weak_kps(
+            kps, error_category, matched_pattern=matched_pattern
+        )
         all_kp_ids = [str(kp.get("id") or kp.get("kp_id")) for kp in kps if kp.get("id") or kp.get("kp_id")]
 
         # Step 3: 计算掌握度变化量
-        mastery_delta = self._calculate_mastery_delta(kps, error_category, score)
+        mastery_delta = self._calculate_mastery_delta(kps, error_category, score, matched_pattern)
 
         # Step 4: 生成诊断结论
         error_conclusion = self._generate_conclusion(
@@ -214,6 +223,7 @@ class DiagnosisService:
             kps=kps,
             weak_kp_ids=weak_kp_ids,
             explanation=explanation,
+            matched_pattern=matched_pattern,
         )
 
         # Step 5: 生成复习建议
@@ -222,6 +232,7 @@ class DiagnosisService:
             kps=kps,
             weak_kp_ids=weak_kp_ids,
             question=question,
+            matched_pattern=matched_pattern,
         )
 
         return {
@@ -229,6 +240,7 @@ class DiagnosisService:
             "error_conclusion": error_conclusion,
             "knowledge_point_ids": all_kp_ids,
             "weak_kp_ids": weak_kp_ids,
+            "error_pattern_id": matched_pattern.get("id") if matched_pattern else None,
             "mastery_delta": mastery_delta,
             "review_suggestions": review_suggestions,
         }
@@ -248,11 +260,17 @@ class DiagnosisService:
         判断错误类型。
 
         优先级：
-        1. 题目预置的 common_mistakes 匹配
+        1. 题目预置的 common_mistakes 匹配（基于用户答案的 cue_terms + missing_terms）
         2. LLM 返回的 error_type 映射
         3. 基于得分和题型的启发式规则
+
+        common_mistakes 支持两种格式（向前兼容）：
+        旧格式: {"error_type": "...", "description": "...", "kp_ids": [...]}
+        新格式: {"id": "...", "error_type": "...", "cue_terms": [...], "missing_terms": [...],
+                 "target_kp_ids": [...], "diagnostic_template": "..."}
         """
         error_type_raw = (error_type_raw or "").strip()
+        user_answer_lower = (user_answer or "").lower()
 
         # 规则1: 未作答 / 空白 → careless_error
         if not user_answer or not user_answer.strip():
@@ -262,15 +280,13 @@ class DiagnosisService:
         if q_type == "code" and "语法" in error_type_raw:
             return "coding_error"
 
-        # 规则3: 常见错误映射匹配
-        if common_mistakes:
-            for mistake in common_mistakes:
-                m_desc = (mistake.get("description") or "").lower()
-                m_type = mistake.get("error_type", "")
-                # 检查用户答案是否包含常见错误关键词
-                if m_desc and m_desc in (explanation or "").lower():
-                    if m_type in ERROR_CATEGORIES:
-                        return m_type
+        # 规则3: 常见错误模式匹配（基于用户答案内容，不是 LLM 解释）
+        if common_mistakes and user_answer_lower:
+            matched = self._match_error_pattern(common_mistakes, user_answer_lower)
+            if matched:
+                self._last_matched_pattern = matched.get("id")
+                if matched.get("error_type") in ERROR_CATEGORIES:
+                    return matched["error_type"]
 
         # 规则4: 基于 LLM error_type 的关键词映射
         error_keywords = {
@@ -301,15 +317,97 @@ class DiagnosisService:
         else:
             return "expression_problem"
 
+    def _match_error_pattern(
+        self,
+        common_mistakes: List[dict],
+        user_answer_lower: str,
+    ) -> Optional[dict]:
+        """
+        基于用户答案匹配错误模式。
+
+        匹配逻辑：
+        - 新格式：检查 cue_terms（用户答案中出现的错误关键词）和 missing_terms（用户答案中缺失的正确关键词）
+        - 旧格式：向前兼容，检查 description 是否出现在用户答案中
+
+        评分：
+        - 每个 cue_term 命中 +1
+        - 每个 missing_term 确实缺失 +1
+        - 得分 >= 2 视为匹配
+        """
+        best_match = None
+        best_score = 0
+
+        for mistake in common_mistakes:
+            score = 0
+
+            # 新格式：cue_terms + missing_terms
+            cue_terms = mistake.get("cue_terms", [])
+            missing_terms = mistake.get("missing_terms", [])
+
+            if cue_terms or missing_terms:
+                # 检查 cue_terms：用户答案中出现了错误的关键词
+                for term in cue_terms:
+                    if term.lower() in user_answer_lower:
+                        score += 1
+
+                # 检查 missing_terms：用户答案中缺少正确的关键词
+                # （注意：这是启发式，完全没有关键词可能是完全不会，也可能是表达简略）
+                missing_count = 0
+                for term in missing_terms:
+                    if term.lower() not in user_answer_lower:
+                        missing_count += 1
+                # 至少有一半缺失关键词才算
+                if missing_terms and missing_count >= max(1, len(missing_terms) // 2):
+                    score += min(2, missing_count)
+
+                # 如果有 cue_terms 且至少命中一个，优先级更高
+                if cue_terms and score >= 1:
+                    score += 1
+
+            # 旧格式向前兼容
+            else:
+                desc = (mistake.get("description") or "").lower()
+                if desc and desc in user_answer_lower:
+                    score = 2  # 旧格式匹配给个基础分
+
+            if score > best_score and score >= 2:
+                best_score = score
+                best_match = mistake
+
+        return best_match
+
     # ---------- Step 2: 薄弱知识点定位 ----------
 
     def _identify_weak_kps(
         self,
         knowledge_points: List[dict],
         error_category: str,
+        matched_pattern: dict = None,
     ) -> List[str]:
-        """从题目关联的知识点中识别薄弱点"""
+        """从题目关联的知识点中识别薄弱点
+
+        如果匹配到了错误模式，优先使用模式中的 target_kp_ids。
+        """
         kp_ids = []
+
+        # 优先使用错误模式中的目标知识点
+        if matched_pattern:
+            pattern_kp_ids = matched_pattern.get("target_kp_ids") or matched_pattern.get("kp_ids") or []
+            if pattern_kp_ids:
+                # 检查这些 kp_id 是否在题目关联的知识点中
+                available_kp_ids = {
+                    str(kp.get("id") or kp.get("kp_id"))
+                    for kp in knowledge_points
+                    if kp.get("id") or kp.get("kp_id")
+                }
+                for pkid in pattern_kp_ids:
+                    pkid_str = str(pkid)
+                    if pkid_str in available_kp_ids:
+                        kp_ids.append(pkid_str)
+                if kp_ids:
+                    return kp_ids
+
+        # 回退到基于 role 的推断
         for kp in knowledge_points:
             kp_id = kp.get("id") or kp.get("kp_id")
             if not kp_id:
@@ -331,6 +429,7 @@ class DiagnosisService:
         knowledge_points: List[dict],
         error_category: str,
         score: float,
+        matched_pattern: dict = None,
     ) -> Dict[str, float]:
         """
         计算每个知识点的掌握度变化量。
@@ -339,12 +438,20 @@ class DiagnosisService:
             base_penalty = ERROR_CATEGORIES[error_category].mastery_penalty
             难度系数：hard × 1.2, medium × 1.0, easy × 0.8
             得分系数：0 分 × 1.0, 30 分 × 0.7, 50 分 × 0.5
+
+        如果匹配到错误模式，模式中的 target_kp_ids 惩罚加重。
         """
         category_info = ERROR_CATEGORIES.get(error_category, ERROR_CATEGORIES["concept_missing"])
         base_penalty = category_info["mastery_penalty"]
 
         # 得分越高，惩罚越小（说明部分掌握）
         score_factor = max(0.3, 1.0 - (score / 100.0) * 0.7)
+
+        # 错误模式中的目标知识点
+        pattern_kp_ids = set()
+        if matched_pattern:
+            for kid in (matched_pattern.get("target_kp_ids") or matched_pattern.get("kp_ids") or []):
+                pattern_kp_ids.add(str(kid))
 
         mastery_delta = {}
         for kp in knowledge_points:
@@ -353,14 +460,19 @@ class DiagnosisService:
                 continue
             role = kp.get("role", "primary")
             weight = kp.get("weight", 1.0)
+            kp_id_str = str(kp_id)
 
             # 主要知识点惩罚多，次要少
             role_multiplier = 1.0 if role == "primary" else 0.5
             if role == "distractor":
                 role_multiplier = 0.3
 
+            # 如果是错误模式的目标知识点，惩罚加重
+            if kp_id_str in pattern_kp_ids:
+                role_multiplier = max(role_multiplier, 1.2)
+
             delta = round(-base_penalty * score_factor * weight * role_multiplier, 1)
-            mastery_delta[str(kp_id)] = delta
+            mastery_delta[kp_id_str] = delta
 
         return mastery_delta
 
@@ -372,8 +484,27 @@ class DiagnosisService:
         kps: List[dict],
         weak_kp_ids: List[str],
         explanation: str,
+        matched_pattern: dict = None,
     ) -> str:
-        """生成通俗易懂的诊断结论"""
+        """生成通俗易懂的诊断结论
+
+        如果匹配到了错误模式，优先使用模式的 diagnostic_template。
+        """
+        # 优先使用错误模式的诊断模板
+        if matched_pattern and matched_pattern.get("diagnostic_template"):
+            template = matched_pattern["diagnostic_template"]
+            # 尝试用知识点名称填充模板
+            weak_kp_names = []
+            for kp in kps:
+                kp_id = str(kp.get("id") or kp.get("kp_id", ""))
+                if kp_id in weak_kp_ids:
+                    name = kp.get("name") or kp.get("kp_name", "")
+                    if name:
+                        weak_kp_names.append(name)
+            if weak_kp_names:
+                template = template.replace("{kp}", "、".join(weak_kp_names[:2]))
+            return template
+
         category_info = ERROR_CATEGORIES.get(error_category, {})
         category_label = category_info.get("label", error_category)
 
@@ -416,6 +547,7 @@ class DiagnosisService:
         kps: List[dict],
         weak_kp_ids: List[str],
         question: dict,
+        matched_pattern: dict = None,
     ) -> List[dict]:
         """
         生成具体的复习建议动作。
@@ -448,6 +580,27 @@ class DiagnosisService:
             })
             return suggestions
 
+        # 如果匹配到错误模式且有对比概念，优先生成概念对比
+        if matched_pattern and error_category == "concept_confusion":
+            pattern_kp_ids = matched_pattern.get("target_kp_ids") or matched_pattern.get("kp_ids") or []
+            if len(pattern_kp_ids) >= 2:
+                kp_names = []
+                for kid in pattern_kp_ids:
+                    for kp in kps:
+                        if str(kp.get("id") or kp.get("kp_id")) == str(kid):
+                            kp_names.append(kp.get("name") or "")
+                            break
+                if len(kp_names) >= 2:
+                    suggestions.append({
+                        "action": "concept_comparison",
+                        "kp_id": pattern_kp_ids[0],
+                        "kp_name": kp_names[0],
+                        "target_kp_ids": pattern_kp_ids[:2],
+                        "title": f"「{kp_names[0]}」vs「{kp_names[1]}」对比辨析",
+                        "description": "对比两个易混淆概念的核心区别，做辨析题巩固",
+                        "priority": base_priority,
+                    })
+
         # 针对每个薄弱知识点生成建议
         for i, kp in enumerate(weak_kps):
             kp_id = str(kp.get("id") or kp.get("kp_id"))
@@ -463,8 +616,8 @@ class DiagnosisService:
                 "priority": base_priority,
             })
 
-            # 概念混淆 → 增加概念对比练习
-            if error_category == "concept_confusion":
+            # 概念混淆 → 增加概念对比练习（如果还没加）
+            if error_category == "concept_confusion" and not matched_pattern:
                 suggestions.append({
                     "action": "concept_comparison",
                     "kp_id": kp_id,

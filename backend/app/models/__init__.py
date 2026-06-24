@@ -110,6 +110,64 @@ class ChunkKnowledgeLink(Base):
     knowledge_point = relationship("KnowledgePoint", back_populates="chunk_links")
 
 
+# ============== 学习规划 ==============
+
+class StudyPlan(Base):
+    """学习计划"""
+    __tablename__ = "study_plans"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(String(100), nullable=False, default="default_user")
+    name = Column(String(200), nullable=False)
+    objective = Column(Text, nullable=True)  # 学习目标描述
+    status = Column(String(20), default="active")  # active, completed, paused
+    config = Column(JSON, nullable=True)  # { target_kp_ids, difficulty, sessions_per_week }
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    sessions = relationship("PracticeSession", back_populates="plan", cascade="all, delete-orphan")
+
+
+class PracticeSession(Base):
+    """练习会话：一次刷题/测试"""
+    __tablename__ = "practice_sessions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(String(100), nullable=False, default="default_user")
+    plan_id = Column(UUID(as_uuid=True), ForeignKey("study_plans.id", ondelete="SET NULL"), nullable=True)
+    mode = Column(String(30), default="adaptive")  # adaptive, review, explore, custom
+    # adaptive: 自适应出题; review: 复习到期; explore: 探索新知识点
+    status = Column(String(20), default="in_progress")  # in_progress, completed, abandoned
+    question_count = Column(Integer, default=5)
+    score = Column(Float, nullable=True)
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    plan = relationship("StudyPlan", back_populates="sessions")
+    session_questions = relationship("PracticeSessionQuestion", back_populates="session", cascade="all, delete-orphan")
+
+
+class PracticeSessionQuestion(Base):
+    """练习会话中的题目"""
+    __tablename__ = "practice_session_questions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(UUID(as_uuid=True), ForeignKey("practice_sessions.id", ondelete="CASCADE"), nullable=False)
+    question_id = Column(UUID(as_uuid=True), ForeignKey("questions.id", ondelete="CASCADE"), nullable=False)
+    sequence = Column(Integer, default=0)  # 题目顺序
+    selected_reason = Column(String(50), nullable=True)  # 选题原因
+    # review_due: 复习到期; low_mastery: 低掌握度; high_importance: 高重要性; prerequisite: 前置知识
+    score = Column(Float, nullable=True)
+    is_correct = Column(Boolean, nullable=True)
+    answered_at = Column(DateTime, nullable=True)
+
+    session = relationship("PracticeSession", back_populates="session_questions")
+    question = relationship("Question")
+
+
 # ============== 题目体系 ==============
 
 class Question(Base):
@@ -242,7 +300,10 @@ class UserMastery(Base):
     wrong_count = Column(Integer, default=0)
     correct_count = Column(Integer, default=0)
     recent_accuracy = Column(Float, nullable=True)  # 最近 N 次的正确率
-    last_practiced_at = Column(DateTime, nullable=True)
+    last_practiced_at = Column(DateTime, nullable=True)  # 最后一次练习时间
+    last_success_at = Column(DateTime, nullable=True)  # 最后一次答对时间
+    last_reviewed_at = Column(DateTime, nullable=True)  # 最后一次复习时间
+    mastered_at = Column(DateTime, nullable=True)  # 首次达到 mastered 的时间
     confidence = Column(Float, default=0.0)  # 系统对掌握状态的置信度 0-1
     review_due_at = Column(DateTime, nullable=True)  # 下次复习时间
     streak = Column(Integer, default=0)  # 连续正确次数
@@ -251,6 +312,40 @@ class UserMastery(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     knowledge_point = relationship("KnowledgePoint", back_populates="mastery_records")
+    mastery_events = relationship("MasteryEvent", back_populates="mastery", cascade="all, delete-orphan")
+
+
+class MasteryEvent(Base):
+    """掌握度变更事件（逐题逐知识点记录）
+
+    每道题的每个知识点都会产生一条事件记录，用于追溯掌握度变化历史。
+    """
+    __tablename__ = "mastery_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(String(100), nullable=False, default="default_user")
+    mastery_id = Column(UUID(as_uuid=True), ForeignKey("user_mastery.id", ondelete="CASCADE"), nullable=False)
+    knowledge_point_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_points.id", ondelete="CASCADE"), nullable=False)
+    answer_id = Column(UUID(as_uuid=True), ForeignKey("test_answers.id", ondelete="SET NULL"), nullable=True)
+    question_id = Column(UUID(as_uuid=True), nullable=True)
+
+    # 事件信息
+    event_type = Column(String(30), nullable=False)  # answer_correct, answer_wrong, review, manual_adjust
+    is_correct = Column(Boolean, nullable=True)
+    delta = Column(Float, default=0.0)  # 本次分数变化量
+    score_before = Column(Float, nullable=True)  # 变化前分数
+    score_after = Column(Float, nullable=True)  # 变化后分数
+    status_before = Column(String(20), nullable=True)  # 变化前状态
+    status_after = Column(String(20), nullable=True)  # 变化后状态
+
+    # 错误分类（答错时）
+    error_category = Column(String(50), nullable=True)  # concept_missing, concept_confusion, ...
+    error_pattern_id = Column(String(100), nullable=True)  # 匹配到的错误模式 ID
+
+    metadata = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    mastery = relationship("UserMastery", back_populates="mastery_events")
 
 
 # ============== 复习任务 ==============
@@ -267,6 +362,8 @@ class ReviewTask(Base):
     title = Column(String(500), nullable=False)
     description = Column(Text, nullable=True)
     action = Column(JSON, nullable=True)  # 具体动作 {type, target_id, ...}
+    target = Column(JSON, nullable=True)  # 任务目标 {document_id, chunk_ids, question_ids, ...}
+    next_action = Column(JSON, nullable=True)  # 完成后下一步动作 {type, ...}
     priority = Column(Integer, default=5)  # 优先级 1-10
     status = Column(String(20), default="pending")  # pending, in_progress, completed, skipped
     due_at = Column(DateTime, nullable=True)

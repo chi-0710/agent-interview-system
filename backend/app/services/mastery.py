@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import UserMastery, KnowledgePoint, ReviewTask
+from app.models import UserMastery, KnowledgePoint, ReviewTask, MasteryEvent
 
 logger = logging.getLogger(__name__)
 
@@ -127,51 +127,75 @@ class MasteryService:
         mastery_delta: Dict[str, float],
         is_correct: bool,
         question_difficulty: str = "medium",
+        answer_id: str = None,
+        question_id: str = None,
+        error_category: str = None,
+        error_pattern_id: str = None,
     ) -> Dict[str, dict]:
         """
         应用掌握度变化量，更新用户掌握状态。
+        为每个知识点创建 MasteryEvent 记录。
+
+        注意：这里 is_correct 是"这道题"的对错，不是整套题。
+        每道题的每个知识点单独调用本方法。
 
         Args:
             db: 数据库会话
             user_id: 用户 ID
             mastery_delta: {kp_id: delta_value} 正值加分，负值扣分
-            is_correct: 本次是否答对
+            is_correct: 本题是否答对
             question_difficulty: 题目难度
+            answer_id: 作答记录 ID
+            question_id: 题目 ID
+            error_category: 错误分类（答错时）
+            error_pattern_id: 错误模式 ID（答错时）
 
         Returns:
             {kp_id: {status, mastery_score, streak, ...}} 更新后的掌握度信息
         """
         results = {}
         now = datetime.utcnow()
+        event_type = "answer_correct" if is_correct else "answer_wrong"
 
         for kp_id, delta in mastery_delta.items():
             mastery = await self.get_or_create_mastery(db, user_id, kp_id)
 
+            # 保存变化前状态（用于事件记录）
+            score_before = mastery.mastery_score or 0.0
+            status_before = mastery.status
+            old_streak = mastery.streak or 0
+
             # 应用分数变化，限制在 0-100
-            old_score = mastery.mastery_score or 0.0
-            new_score = max(0.0, min(100.0, old_score + delta))
+            new_score = max(0.0, min(100.0, score_before + delta))
             mastery.mastery_score = new_score
 
-            # 更新计数
+            # 更新计数（按本题的对错，不是整场）
             if is_correct:
                 mastery.correct_count = (mastery.correct_count or 0) + 1
-                mastery.streak = (mastery.streak or 0) + 1
+                mastery.streak = old_streak + 1
+                mastery.last_success_at = now
             else:
                 mastery.wrong_count = (mastery.wrong_count or 0) + 1
                 mastery.streak = 0  # 答错重置连续正确
 
-            # 更新最近正确率（最近10次）
+            # 更新最近正确率
             total = (mastery.correct_count or 0) + (mastery.wrong_count or 0)
             if total > 0:
                 mastery.recent_accuracy = (mastery.correct_count or 0) / total
 
-            # 更新最后练习时间
+            # 更新最后练习时间（放在状态计算之后，避免影响遗忘判断）
+            # 注意：先不更新 last_practiced_at，等状态计算完再更新
+
+            # 重新计算状态（使用旧的 last_practiced_at 来判断遗忘）
+            new_status = self._calculate_status(mastery, now=now, use_current_last_practiced=True)
+            mastery.status = new_status
+
+            # 现在才更新最后练习时间
             mastery.last_practiced_at = now
 
-            # 重新计算状态
-            old_status = mastery.status
-            new_status = self._calculate_status(mastery)
-            mastery.status = new_status
+            # 记录首次 mastered 时间
+            if new_status == "mastered" and not mastery.mastered_at:
+                mastery.mastered_at = now
 
             # 计算置信度
             mastery.confidence = self._calculate_confidence(mastery)
@@ -179,12 +203,31 @@ class MasteryService:
             # 计算下次复习时间
             mastery.review_due_at = self._calculate_review_due(mastery)
 
+            # 创建掌握度事件记录
+            event = MasteryEvent(
+                user_id=user_id,
+                mastery_id=mastery.id,
+                knowledge_point_id=kp_id,
+                answer_id=answer_id,
+                question_id=question_id,
+                event_type=event_type,
+                is_correct=is_correct,
+                delta=delta,
+                score_before=score_before,
+                score_after=new_score,
+                status_before=status_before,
+                status_after=new_status,
+                error_category=error_category if not is_correct else None,
+                error_pattern_id=error_pattern_id if not is_correct else None,
+            )
+            db.add(event)
+
             # 记录状态变化
-            if old_status != new_status:
+            if status_before != new_status:
                 logger.info(
                     f"[mastery] user={user_id} kp={kp_id}: "
-                    f"{old_status} → {new_status} "
-                    f"(score: {old_score:.1f} → {new_score:.1f})"
+                    f"{status_before} → {new_status} "
+                    f"(score: {score_before:.1f} → {new_score:.1f})"
                 )
 
             results[kp_id] = {
@@ -198,11 +241,14 @@ class MasteryService:
                 "confidence": round(mastery.confidence, 2),
                 "review_due_at": mastery.review_due_at.isoformat() if mastery.review_due_at else None,
                 "last_practiced_at": mastery.last_practiced_at.isoformat() if mastery.last_practiced_at else None,
-                "status_changed": old_status != new_status,
-                "old_status": old_status,
+                "last_success_at": mastery.last_success_at.isoformat() if mastery.last_success_at else None,
+                "mastered_at": mastery.mastered_at.isoformat() if mastery.mastered_at else None,
+                "status_changed": status_before != new_status,
+                "old_status": status_before,
                 "delta": delta,
             }
 
+        await db.flush()
         return results
 
     async def get_user_mastery_list(
@@ -211,8 +257,13 @@ class MasteryService:
         user_id: str,
         category: str = None,
         status: str = None,
+        refresh: bool = True,
     ) -> List[dict]:
-        """获取用户所有知识点的掌握情况"""
+        """获取用户所有知识点的掌握情况
+
+        Args:
+            refresh: 是否先刷新状态（检查遗忘等）
+        """
         query = select(UserMastery).where(UserMastery.user_id == user_id)
 
         if status:
@@ -220,6 +271,18 @@ class MasteryService:
 
         result = await db.execute(query)
         masteries = result.scalars().all()
+
+        # 读取时刷新状态（检查遗忘）
+        if refresh and masteries:
+            now = datetime.utcnow()
+            for m in masteries:
+                old_status = m.status
+                new_status = self._calculate_status(m, now=now, use_current_last_practiced=True)
+                if old_status != new_status:
+                    logger.info(f"[mastery/refresh] kp={m.knowledge_point_id}: {old_status} → {new_status}")
+                    m.status = new_status
+                    m.confidence = self._calculate_confidence(m)
+                    m.review_due_at = self._calculate_review_due(m)
 
         # 关联知识点信息
         kp_ids = [str(m.knowledge_point_id) for m in masteries]
@@ -249,6 +312,8 @@ class MasteryService:
                 "confidence": round(m.confidence, 2) if m.confidence else 0,
                 "review_due_at": m.review_due_at.isoformat() if m.review_due_at else None,
                 "last_practiced_at": m.last_practiced_at.isoformat() if m.last_practiced_at else None,
+                "last_success_at": m.last_success_at.isoformat() if m.last_success_at else None,
+                "mastered_at": m.mastered_at.isoformat() if m.mastered_at else None,
             })
 
         # 按掌握度排序，最薄弱的在前
@@ -293,12 +358,70 @@ class MasteryService:
             for m in masteries
         ]
 
+    async def get_evidence_chunks_for_kps(
+        self,
+        db: AsyncSession,
+        kp_ids: List[str],
+        limit_per_kp: int = 3,
+    ) -> dict:
+        """
+        批量获取知识点对应的证据文档段落。
+
+        Returns:
+            { kp_id: [ {chunk_id, document_id, section_path, start_line, end_line, content, relevance} ] }
+        """
+        from app.models import DocumentChunk, ChunkKnowledgeLink, Document
+        from sqlalchemy import select
+
+        if not kp_ids:
+            return {}
+
+        # 查询关联表，按相关度排序
+        result = await db.execute(
+            select(
+                ChunkKnowledgeLink,
+                DocumentChunk,
+                Document,
+            )
+            .join(DocumentChunk, ChunkKnowledgeLink.chunk_id == DocumentChunk.id)
+            .join(Document, DocumentChunk.document_id == Document.id)
+            .where(ChunkKnowledgeLink.knowledge_point_id.in_(kp_ids))
+            .order_by(
+                ChunkKnowledgeLink.knowledge_point_id,
+                ChunkKnowledgeLink.relevance.desc(),
+            )
+        )
+        rows = result.all()
+
+        result_map = {kp_id: [] for kp_id in kp_ids}
+        counts = {kp_id: 0 for kp_id in kp_ids}
+
+        for link, chunk, doc in rows:
+            kp_id = str(link.knowledge_point_id)
+            if counts.get(kp_id, 0) >= limit_per_kp:
+                continue
+            result_map[kp_id].append({
+                "chunk_id": str(chunk.id),
+                "document_id": str(doc.id),
+                "document_path": doc.file_path,
+                "document_title": doc.title,
+                "section_path": chunk.section_path,
+                "start_line": chunk.start_line,
+                "end_line": chunk.end_line,
+                "content_preview": chunk.content[:200] if chunk.content else "",
+                "relevance": link.relevance,
+            })
+            counts[kp_id] = counts.get(kp_id, 0) + 1
+
+        return result_map
+
     async def create_review_tasks_from_diagnosis(
         self,
         db: AsyncSession,
         user_id: str,
         diagnosis: dict,
         diagnosis_id: str = None,
+        question_id: str = None,
     ) -> List[dict]:
         """
         根据诊断结果生成复习任务。
@@ -306,8 +429,9 @@ class MasteryService:
         Args:
             db: 数据库会话
             user_id: 用户 ID
-            diagnosis: 诊断结果 {review_suggestions, error_category, ...}
+            diagnosis: 诊断结果 {review_suggestions, error_category, weak_kp_ids, ...}
             diagnosis_id: 诊断记录 ID
+            question_id: 触发诊断的题目 ID
 
         Returns:
             创建的复习任务列表
@@ -326,6 +450,7 @@ class MasteryService:
             description = suggestion.get("description", "")
             priority = suggestion.get("priority", 5)
             delay_hours = suggestion.get("delay_hours", 0)
+            target_kp_ids = suggestion.get("target_kp_ids") or ([kp_id] if kp_id else [])
 
             # 计算截止时间
             due_at = None
@@ -336,10 +461,34 @@ class MasteryService:
             existing = await self._find_existing_task(db, user_id, kp_id, action)
             if existing:
                 # 更新已有任务的优先级
-                if priority > existing.priority:
+                if priority > (existing.priority or 0):
                     existing.priority = priority
                 created_tasks.append(self._task_to_dict(existing))
                 continue
+
+            # 构建 target（任务目标）
+            target = {
+                "knowledge_point_id": kp_id,
+                "knowledge_point_ids": target_kp_ids,
+                "question_id": question_id,
+                # document_id 和 chunk_ids 在文档证据链路接通后填充
+            }
+
+            # 构建 next_action（完成任务后的下一步）
+            next_action = None
+            if action == "review_material":
+                next_action = {
+                    "type": "practice_question",
+                    "knowledge_point_id": kp_id,
+                    "question_count": 2,
+                    "difficulty": "medium",
+                }
+            elif action in ("concept_comparison", "practice_question"):
+                next_action = {
+                    "type": "follow_up_test",
+                    "delay_hours": 48,
+                    "knowledge_point_id": kp_id,
+                }
 
             task = ReviewTask(
                 user_id=user_id,
@@ -348,6 +497,8 @@ class MasteryService:
                 title=title,
                 description=description,
                 action={"type": action, "kp_id": kp_id},
+                target=target,
+                next_action=next_action,
                 priority=priority,
                 status="pending",
                 due_at=due_at,
@@ -430,34 +581,58 @@ class MasteryService:
 
     # ---------- 内部方法 ----------
 
-    def _calculate_status(self, mastery: UserMastery) -> str:
+    def _calculate_status(
+        self,
+        mastery: UserMastery,
+        now: datetime = None,
+        use_current_last_practiced: bool = False,
+    ) -> str:
         """
         根据分数、连续正确次数、遗忘时间计算掌握状态。
 
         状态机：
         - 分数 < 10: unknown
         - 10 <= 分数 < 40: learning
-        - 40 <= 分数 < 70: unstable（或 forgotten，取决于是否曾掌握）
+        - 40 <= 分数 < 70: unstable（或 forgotten，取决于是否曾掌握且长期未复习）
         - 分数 >= 70 且 连续正确 >= 3: mastered
         - 长时间未练习: mastered → unstable → forgotten
+
+        关键修复：
+        1. 遗忘判断从严重到轻：先判断 forgotten（14天），再判断 unstable（7天）
+        2. 使用旧的 last_practiced_at 计算，而不是刚更新的 now
+        3. 只有曾经 mastered 过的才会进入 forgotten
+
+        Args:
+            mastery: 掌握度记录
+            now: 当前时间（用于计算时间差）
+            use_current_last_practiced: True=使用 mastery 上现有的 last_practiced_at（更新前的旧值）
         """
         score = mastery.mastery_score or 0.0
         streak = mastery.streak or 0
-        last_practiced = mastery.last_practiced_at
         current_status = mastery.status or "unknown"
-        now = datetime.utcnow()
+        if now is None:
+            now = datetime.utcnow()
 
-        # 先基于分数判断基础状态
+        # 取最后练习时间（使用更新前的旧值，避免刚答完题就判断遗忘）
+        last_practiced = mastery.last_practiced_at
+
+        # ---- 第一步：基于分数判断基础状态 ----
         if score < 10:
             base_state = "unknown"
         elif score < 40:
             base_state = "learning"
         elif score < 70:
-            # 曾掌握过且长时间没练 → forgotten
-            if current_status in ("mastered", "forgotten") and last_practiced:
+            # 40-70 分区间
+            # 曾掌握过（mastered 或 forgotten）且长期未复习 → forgotten
+            # 注意：先判断更严重的 forgotten，再 fallback 到 unstable
+            was_ever_mastered = (
+                current_status in ("mastered", "forgotten")
+                or mastery.mastered_at is not None
+            )
+            if was_ever_mastered and last_practiced:
                 days_since = (now - last_practiced).days
                 if days_since >= self.forget_days_forgotten:
-                    return "forgotten"
+                    return "forgotten"  # 严重遗忘，直接返回
             base_state = "unstable"
         else:
             # 分数 >= 70
@@ -466,15 +641,17 @@ class MasteryService:
             else:
                 base_state = "unstable"
 
-        # 遗忘检测：mastered 状态长时间未练习
+        # ---- 第二步：遗忘检测（仅针对 mastered 状态）----
+        # 注意：判断顺序从严重到轻微 — 先 forgotten 后 unstable
         if base_state == "mastered" and last_practiced:
             days_since = (now - last_practiced).days
-            if days_since >= self.forget_days_unstable:
-                return "unstable"
+            # 先判断更严重的
             if days_since >= self.forget_days_forgotten:
                 return "forgotten"
+            if days_since >= self.forget_days_unstable:
+                return "unstable"
 
-        # 验证状态转换合法性
+        # ---- 第三步：状态转换合法性检查 ----
         if base_state in STATE_TRANSITIONS.get(current_status, []) or base_state == current_status:
             return base_state
 
@@ -563,6 +740,9 @@ class MasteryService:
             "status": task.status,
             "kp_id": str(task.knowledge_point_id) if task.knowledge_point_id else None,
             "due_at": task.due_at.isoformat() if task.due_at else None,
+            "target": task.target,
+            "next_action": task.next_action,
+            "source_diagnosis_id": str(task.source_diagnosis_id) if task.source_diagnosis_id else None,
         }
 
 

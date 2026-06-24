@@ -53,7 +53,32 @@
 unknown（未学习）→ learning（学习中）→ unstable（掌握不稳）→ mastered（已掌握）→ forgotten（已遗忘）
 ```
 
-每个知识点维护：`mastery_score`、`wrong_count`、`recent_accuracy`、`last_practiced_at`、`confidence`、`review_due_at`、`streak`（连续正确次数）
+每个知识点维护：`mastery_score`、`wrong_count`、`recent_accuracy`、`last_practiced_at`、`last_success_at`、`mastered_at`、`confidence`、`review_due_at`、`streak`（连续正确次数）
+
+### 自适应出题
+
+根据用户掌握状态自动推荐下一组练习题：
+
+- **优先级算法**：复习到期 + 低掌握度 + 高重要性 + 近期错误 + 前置缺失
+- **三种模式**：`adaptive`（自适应）、`review`（复习到期）、`explore`（探索新知）
+- **练习会话**：`StudyPlan` → `PracticeSession` → `PracticeSessionQuestion` 三级结构
+
+### 错误模式库
+
+将常见错误从描述文本改为可判定的结构化模式：
+
+```python
+{
+  "id": "tlb_as_cache",
+  "error_type": "concept_confusion",
+  "cue_terms": ["缓存数据", "CPU Cache"],        # 用户答案中出现错误关键词
+  "missing_terms": ["地址翻译", "页表", "VPN"],   # 用户答案中缺失正确关键词
+  "target_kp_ids": ["kp-os-tlb", "kp-os-cpu-cache"],
+  "diagnostic_template": "将 TLB 误认为 CPU Cache，混淆了缓存对象。"
+}
+```
+
+诊断服务直接基于用户答案内容匹配错误模式，不依赖 LLM 解释文本。
 
 ## 技术栈
 
@@ -163,15 +188,16 @@ backend/
 │   │   ├── learning.py             # 学习状态（掌握度/复习任务/知识点树）
 │   │   └── copilot.py              # AI 伴读
 │   └── services/
-│       ├── diagnosis.py            # 能力诊断服务（错误分类 + 复习建议）
-│       ├── mastery.py              # 掌握度服务（五状态模型 + 评分规则）
+│       ├── diagnosis.py            # 能力诊断服务（错误分类 + 错误模式匹配 + 复习建议）
+│       ├── mastery.py              # 掌握度服务（五状态模型 + 逐事件更新 + 状态刷新）
+│       ├── learning.py             # 学习规划与自适应出题
 │       ├── evaluator.py            # 答案评判服务
 │       ├── error_tags.py           # 错题标签聚合（向后兼容）
 │       ├── llm.py                  # LLM 调用封装
 │       ├── structured_output.py    # 结构化输出中间件
 │       ├── code_executor.py        # 代码沙盒执行
 │       ├── session_manager.py      # 会话管理
-│       ├── ingestion.py            # 文档入库
+│       ├── ingestion.py            # 文档入库（Document + Chunk + KnowledgeLink）
 │       ├── chunker.py              # 文档切片
 │       └── vector_store.py         # 向量存储
 ├── alembic/
@@ -208,12 +234,16 @@ Question ── QuestionKnowledgeLink ─┘
 | `knowledge_relations` | 知识点关系（前置、包含、相似、易混淆） |
 | `document_chunks` | 文档段落及其定位信息 |
 | `chunk_knowledge_links` | 段落与知识点的多对多关联 |
-| `questions` | 题目主体（含评分标准、常见错误映射） |
+| `questions` | 题目主体（含评分标准、常见错误模式） |
 | `question_knowledge_links` | 题目与知识点的多对多映射（primary/secondary/distractor） |
 | `test_answers` | 用户逐题作答记录（Attempt） |
-| `diagnoses` | 对错误的结构化诊断 |
+| `diagnoses` | 对错误的结构化诊断（含 evidence_chunks 证据链） |
 | `user_mastery` | 用户对每个知识点的掌握状态（五状态模型） |
-| `review_tasks` | 系统生成的复习任务 |
+| `mastery_events` | 掌握度变更事件（逐题逐知识点，可追溯） |
+| `review_tasks` | 系统生成的复习任务（含 target + next_action） |
+| `study_plans` | 学习计划 |
+| `practice_sessions` | 练习会话（自适应出题产物） |
+| `practice_session_questions` | 会话题目关联（含选题原因） |
 
 ## 学习闭环流程
 
@@ -229,17 +259,25 @@ Question ── QuestionKnowledgeLink ─┘
                     │  KnowledgePoint  │
                     └────────┬────────┘
                              │
-                             ▼
-┌─────────┐        ┌─────────────────┐        ┌─────────┐
-│ 复习任务 │ ◀──── │   用户作答       │ ──────▶│ 能力诊断 │
-└────┬────┘        │  UserAttempt    │        └────┬────┘
-     │             └─────────────────┘             │
-     │                                             │
-     ▼                                             ▼
-┌─────────┐        ┌─────────────────┐        ┌─────────┐
-│ 复测验证 │ ──────▶│  更新掌握度      │ ◀────── │ 错因分析 │
-└─────────┘        │  UserMastery    │        └─────────┘
-                    └─────────────────┘
+┌──────────────┐              ▼              ┌──────────────┐
+│  自适应出题   │ ◀─────────  │  ───────────▶│  复习任务     │
+│ StudyPlan    │        ┌────┴────┐          │ ReviewTask   │
+│ PracticeSess │        │ 用户作答 │          │ target/next  │
+└──────┬───────┘        │UserAttempt│          └──────┬───────┘
+       │                └────┬────┘                 │
+       │                     │                       │
+       ▼                     ▼                       ▼
+┌──────────────┐      ┌─────────────────┐     ┌──────────────┐
+│  复测验证     │ ────▶│  MasteryEvent   │     │  能力诊断     │
+└──────────────┘      │  逐题逐知识点    │     │  +evidence    │
+                      └────────┬────────┘     └──────┬───────┘
+                               │                     │
+                               ▼                     ▼
+                        ┌─────────────────┐   ┌──────────────┐
+                        │  用户掌握度      │   │ 错误模式匹配  │
+                        │  UserMastery    │   │  cue/missing  │
+                        │  五状态 + 遗忘   │   └──────────────┘
+                        └─────────────────┘
 ```
 
 ## API 概览
@@ -255,6 +293,9 @@ Question ── QuestionKnowledgeLink ─┘
 | POST | `/api/learning/review-tasks/{id}/complete` | 标记复习任务完成 |
 | GET | `/api/learning/knowledge-tree` | 获取知识点树 |
 | GET | `/api/learning/knowledge-points/{id}` | 获取知识点详情 |
+| **POST** | **`/api/learning/next-session`** | **生成下一个自适应练习会话** |
+| GET | `/api/learning/sessions` | 练习会话列表 |
+| GET | `/api/learning/plans` | 学习计划列表 |
 
 ### 测试 API
 
@@ -269,9 +310,10 @@ Question ── QuestionKnowledgeLink ─┘
 
 - [x] **第一阶段**：统一知识点体系（文档、题目、错题、高亮全部映射到 KnowledgePoint）
 - [x] **第二阶段**：完整答题记录（保存每一次作答、得分、错误类型和反馈）
-- [x] **第三阶段**：用户掌握度模型（五状态 + 评分规则）
-- [x] **第四阶段**：复习任务与学习计划（答错后自动安排回看、练习和复测）
-- [ ] **第五阶段**：自适应选题（按薄弱点和遗忘风险出题）
+- [x] **第三阶段**：用户掌握度模型（五状态 + 评分规则 + MasteryEvent 可追溯）
+- [x] **第四阶段**：复习任务与学习计划（答错后自动安排回看、练习和复测，target + next_action）
+- [x] **第五阶段**：自适应出题（按薄弱点和遗忘风险出题，StudyPlan + PracticeSession）
+- [x] **第五阶段增强**：错误模式库（cue_terms + missing_terms 可判定诊断） + 文档证据链路（DocumentChunk + ChunkKnowledgeLink）
 - [ ] **第六阶段**：模拟面试（计时、追问、能力报告、岗位维度评估）
 - [ ] **第七阶段**：Agent 编排（诊断、规划、出题、反馈形成自动闭环）
 

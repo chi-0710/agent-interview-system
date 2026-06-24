@@ -451,23 +451,51 @@ async def submit_test(req: SubmitRequest) -> dict:
 
                 await session.flush()
 
-                # 6.4 更新用户掌握度
-                if all_mastery_delta:
-                    any_correct = any(d["correct"] for d in enriched_evals)
-                    mastery_updates = await mastery_service.apply_mastery_delta(
+                # 6.4 更新用户掌握度（逐题逐知识点，不是整场聚合）
+                # 关键：每道题单独更新，正确的题加分+增加streak，错误的题扣分+重置streak
+                mastery_updates = {}
+                for diag in diagnoses:
+                    qid = diag["questionId"]
+                    answer_record = answer_records.get(qid)
+                    if not answer_record:
+                        continue
+
+                    mastery_delta = diag.get("mastery_delta", {})
+                    if not mastery_delta:
+                        continue
+
+                    # 本题的诊断结果
+                    is_correct = answer_record.is_correct
+                    error_category = diag.get("error_category")
+                    error_pattern_id = diag.get("error_pattern_id")
+
+                    # 逐知识点应用掌握度变化（每道题单独计算，不是整场）
+                    per_q_updates = await mastery_service.apply_mastery_delta(
                         db=session,
                         user_id=USER_ID,
-                        mastery_delta=all_mastery_delta,
-                        is_correct=any_correct,
+                        mastery_delta=mastery_delta,
+                        is_correct=is_correct,
+                        answer_id=str(answer_record.id),
+                        question_id=qid,
+                        error_category=error_category,
+                        error_pattern_id=error_pattern_id,
                     )
+
+                    # 合并到总结果（同一知识点被多道题更新时，取最后一次）
+                    for kp_id, update in per_q_updates.items():
+                        mastery_updates[kp_id] = update
 
                 # 6.5 生成复习任务
                 for diag in diagnoses:
                     if diag.get("error_category"):
+                        question_id = diag.get("questionId")
+                        diagnosis_id = diagnosis_ids.get(question_id)
                         tasks = await mastery_service.create_review_tasks_from_diagnosis(
                             db=session,
                             user_id=USER_ID,
                             diagnosis=diag,
+                            diagnosis_id=diagnosis_id,
+                            question_id=question_id,
                         )
                         review_tasks.extend(tasks)
 
@@ -477,6 +505,26 @@ async def submit_test(req: SubmitRequest) -> dict:
                     user_id=USER_ID,
                     limit=5,
                 )
+
+                # 6.7 为诊断结果补充证据 chunks
+                all_weak_kp_ids = set()
+                for diag in diagnoses:
+                    for kp_id in diag.get("weak_kp_ids", []):
+                        all_weak_kp_ids.add(str(kp_id))
+                if all_weak_kp_ids:
+                    evidence_map = await mastery_service.get_evidence_chunks_for_kps(
+                        db=session,
+                        kp_ids=list(all_weak_kp_ids),
+                        limit_per_kp=3,
+                    )
+                    for diag in diagnoses:
+                        diag_evidence = {}
+                        for kp_id in diag.get("weak_kp_ids", []):
+                            chunks = evidence_map.get(str(kp_id), [])
+                            if chunks:
+                                diag_evidence[str(kp_id)] = chunks
+                        if diag_evidence:
+                            diag["evidence_chunks"] = diag_evidence
 
                 await session.commit()
                 logger.info(f"[test/submit] persisted session={session_id}")
