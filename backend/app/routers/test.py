@@ -1,6 +1,8 @@
 """测试路由
 
-- POST /api/test/submit  → 提交答案，并发评判，返回 feedback + errorTags
+学习闭环核心路由：提交答案 → 评判 → 诊断 → 更新掌握度 → 生成复习任务 → 返回反馈
+
+- POST /api/test/submit  → 提交答案，返回完整学习闭环结果
 - GET  /api/test/sessions → 测试会话列表
 """
 import asyncio
@@ -13,16 +15,20 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
-from app.database import get_db
-from app.models import TestSession, TestAnswer, Question
+from app.database import get_db, async_session_factory
+from app.models import TestSession, TestAnswer, Question, Diagnosis, KnowledgePoint, QuestionKnowledgeLink
 from app.services.evaluator import evaluate_answer as evaluate_single
 from app.services.evaluator import evaluate_code_answer
 from app.services.error_tags import aggregate_error_tags
+from app.services.diagnosis import get_diagnosis_service
+from app.services.mastery import get_mastery_service
 from app.services.llm import chat as llm_chat
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/test", tags=["test"])
+
+USER_ID = "default_user"  # 暂用默认用户，后续接入认证
 
 
 # ---- Models ----
@@ -42,6 +48,8 @@ class AnswerItem(BaseModel):
 class SubmitRequest(BaseModel):
     file_path: str
     answers: List[AnswerItem] = []
+    session_id: Optional[str] = None  # 可选：属于某个练习会话
+    mode: Optional[str] = "learn"  # learn | mock_interview
 
     @field_validator("file_path")
     @classmethod
@@ -173,25 +181,67 @@ def _score_by_rules(question: dict, user_answer: str) -> dict:
     }
 
 
+async def _load_question_knowledge_links(session, question_ids: List[str]) -> dict:
+    """加载题目关联的知识点信息"""
+    try:
+        result = await session.execute(
+            select(QuestionKnowledgeLink, KnowledgePoint)
+            .join(KnowledgePoint, QuestionKnowledgeLink.knowledge_point_id == KnowledgePoint.id)
+            .where(QuestionKnowledgeLink.question_id.in_(question_ids))
+        )
+        rows = result.all()
+
+        kp_map = {}
+        for link, kp in rows:
+            qid = str(link.question_id)
+            if qid not in kp_map:
+                kp_map[qid] = []
+            kp_map[qid].append({
+                "id": str(kp.id),
+                "name": kp.name,
+                "path": kp.path,
+                "importance": kp.importance,
+                "role": link.role,
+                "weight": link.weight,
+            })
+        return kp_map
+    except Exception as e:
+        logger.warning(f"[test/submit] load knowledge links failed: {e}")
+        return {}
+
+
 @router.post("/submit")
 async def submit_test(req: SubmitRequest) -> dict:
     """
-    提交测试答案，返回评判结果和错题标签。
+    提交测试答案，返回完整学习闭环结果。
 
-    策略：
-    - 优先走 PostgreSQL + LLM 完整链路
-    - 失败时自动降级：内置题库 + 规则判分（关键词覆盖度）
+    处理流程：
+    1. 加载题目（DB 优先，内置题库兜底）
+    2. 并发评判答案（LLM 优先，规则判分兜底）
+    3. 能力诊断：错误分类、薄弱知识点定位
+    4. 更新用户掌握度（五状态模型）
+    5. 生成复习任务
+    6. 持久化所有数据（DB 可用时）
+    7. 返回完整反馈
+
+    返回字段（向后兼容 + 新增）：
+    - score / summary / details / errorTags（原有）
+    - diagnoses: 每道题的结构化诊断
+    - mastery_updates: 掌握度变化
+    - review_tasks: 生成的复习任务
+    - weak_points: 薄弱知识点总结
     """
-    # 策略 A: PostgreSQL + LLM
+    diagnosis_service = get_diagnosis_service()
+    mastery_service = get_mastery_service()
+
+    # ========== Step 1: 加载题目 ==========
     questions = None
     used_db = False
     try:
-        from app.database import async_session_factory
-        from app.models import Question as _Q
         async with async_session_factory() as session:
             q_ids = [a.question_id for a in req.answers]
             result = await session.execute(
-                select(_Q).where(_Q.id.in_(q_ids))
+                select(Question).where(Question.id.in_(q_ids))
             )
             db_qs = result.scalars().all()
             if db_qs:
@@ -199,12 +249,14 @@ async def submit_test(req: SubmitRequest) -> dict:
                     "id": str(q.id), "type": q.type or "text", "content": q.content,
                     "expected_answer": q.expected_answer or "", "options": q.options,
                     "tags": q.tags or [], "sections": q.sections or [],
+                    "difficulty": q.difficulty or "medium",
+                    "common_mistakes": q.common_mistakes,
+                    "rubric": q.rubric,
                 } for q in db_qs}
                 used_db = True
     except Exception as e:
         logger.warning(f"[test/submit] DB 不可用，降级到内置题库: {e}")
 
-    # 策略 B: 内置内存题库
     if not questions:
         questions = {qid: IN_MEMORY_QUESTIONS.get(qid) for qid in
                      [a.question_id for a in req.answers]}
@@ -213,7 +265,7 @@ async def submit_test(req: SubmitRequest) -> dict:
     if not questions:
         raise HTTPException(status_code=404, detail="未找到对应题目")
 
-    # 构建评判任务
+    # ========== Step 2: 并发评判 ==========
     eval_tasks = []
     answer_map = []
     for ans in req.answers:
@@ -221,11 +273,9 @@ async def submit_test(req: SubmitRequest) -> dict:
         if not q:
             continue
         answer_map.append((ans, q))
-        # 有 LLM 就走 LLM，否则规则判分
         if used_db:
             q_type = q.get("type", "text")
             if q_type == "code":
-                # 代码题走混合评判：物理执行 + LLM 错因
                 eval_tasks.append(
                     evaluate_code_answer(
                         question=q["content"],
@@ -234,7 +284,6 @@ async def submit_test(req: SubmitRequest) -> dict:
                     )
                 )
             else:
-                # 文字/选择题走 LLM 评判
                 eval_tasks.append(
                     evaluate_single(
                         question=q["content"],
@@ -243,12 +292,11 @@ async def submit_test(req: SubmitRequest) -> dict:
                     )
                 )
         else:
-            eval_tasks.append(None)  # 标记：需要规则判分
+            eval_tasks.append(None)
 
     if not eval_tasks:
         raise HTTPException(status_code=400, detail="没有可评判的题目")
 
-    # 并发评判（DB 可用时用 LLM；否则本地规则）
     logger.info(f"[test/submit] evaluating {len(eval_tasks)} questions")
     t0 = datetime.utcnow()
 
@@ -262,10 +310,22 @@ async def submit_test(req: SubmitRequest) -> dict:
     elapsed = (datetime.utcnow() - t0).total_seconds()
     logger.info(f"[test/submit] evaluation done in {elapsed:.1f}s (mode: {'LLM' if used_db else 'rules'})")
 
-    # 构建 details + 汇聚评判数据
+    # ========== Step 3: 加载知识点关联（DB 模式下） ==========
+    question_kps = {}
+    if used_db:
+        try:
+            async with async_session_factory() as session:
+                q_ids = [str(q["id"]) for q in questions.values()]
+                question_kps = await _load_question_knowledge_links(session, q_ids)
+        except Exception as e:
+            logger.warning(f"[test/submit] load knowledge links failed: {e}")
+
+    # ========== Step 4: 逐题诊断 + 构建结果 ==========
     details = []
     scores = []
     enriched_evals = []
+    diagnoses = []
+    all_mastery_delta = {}
 
     for i, (ans, q) in enumerate(answer_map):
         raw = eval_results[i] if i < len(eval_results) else None
@@ -302,10 +362,129 @@ async def submit_test(req: SubmitRequest) -> dict:
             },
         })
 
-    # 4. 聚合 errorTags
+        # ---- 能力诊断 ----
+        kps_for_q = question_kps.get(str(q.get("id")), [])
+        eval_with_answer = {**result_dict, "user_answer": ans.user_answer}
+
+        diag_result = diagnosis_service.diagnose(
+            question=q,
+            evaluation=eval_with_answer,
+            knowledge_points=kps_for_q,
+            common_mistakes=q.get("common_mistakes"),
+        )
+        diagnoses.append({
+            "questionId": ans.question_id,
+            **diag_result,
+        })
+
+        # 汇总掌握度变化
+        for kp_id, delta in diag_result.get("mastery_delta", {}).items():
+            if kp_id not in all_mastery_delta:
+                all_mastery_delta[kp_id] = 0.0
+            all_mastery_delta[kp_id] += delta
+
+    # ========== Step 5: 聚合 errorTags（向后兼容） ==========
     error_tags = aggregate_error_tags(enriched_evals, req.file_path)
 
-    # 5. 生成 summary
+    # ========== Step 6: 持久化 + 更新掌握度 + 生成复习任务（DB 模式） ==========
+    session_id = None
+    mastery_updates = {}
+    review_tasks = []
+    weak_points = []
+
+    if used_db:
+        try:
+            async with async_session_factory() as session:
+                # 6.1 创建测试会话
+                test_session = TestSession(
+                    title=f"Test-{datetime.utcnow().strftime('%Y%m%d-%H%M')}",
+                    mode=req.mode or "learn",
+                    total_questions=len(eval_tasks),
+                    completed_questions=len(req.answers),
+                    score=round(sum(scores) / len(scores), 1) if scores else 0,
+                    status="completed",
+                    completed_at=datetime.utcnow(),
+                )
+                session.add(test_session)
+                await session.flush()
+                session_id = str(test_session.id)
+
+                # 6.2 保存每道题的作答记录
+                answer_records = {}
+                for i, (ans, q) in enumerate(answer_map):
+                    raw = eval_results[i] if i < len(eval_results) else None
+                    result_dict = raw if not isinstance(raw, Exception) and raw else {}
+                    correct = result_dict.get("correct", False) if not isinstance(raw, Exception) else False
+
+                    answer_record = TestAnswer(
+                        session_id=test_session.id,
+                        question_id=q.get("id"),
+                        answer_text=ans.user_answer,
+                        is_correct=correct,
+                        score=result_dict.get("score", 0),
+                        error_type=result_dict.get("error_type"),
+                        feedback=result_dict.get("explanation", ""),
+                        error_tags=result_dict.get("error_tags", []),
+                    )
+                    session.add(answer_record)
+                    answer_records[ans.question_id] = answer_record
+
+                await session.flush()
+
+                # 6.3 保存诊断记录
+                for diag in diagnoses:
+                    qid = diag["questionId"]
+                    answer_record = answer_records.get(qid)
+                    answer_id = str(answer_record.id) if answer_record else None
+
+                    diag_record = Diagnosis(
+                        answer_id=answer_id,
+                        question_id=qid,
+                        error_category=diag.get("error_category"),
+                        error_conclusion=diag.get("error_conclusion"),
+                        knowledge_point_ids=diag.get("knowledge_point_ids"),
+                        evidence_chunk_ids=diag.get("evidence_chunk_ids"),
+                        mastery_delta=diag.get("mastery_delta"),
+                        review_suggestions=diag.get("review_suggestions"),
+                    )
+                    session.add(diag_record)
+
+                await session.flush()
+
+                # 6.4 更新用户掌握度
+                if all_mastery_delta:
+                    any_correct = any(d["correct"] for d in enriched_evals)
+                    mastery_updates = await mastery_service.apply_mastery_delta(
+                        db=session,
+                        user_id=USER_ID,
+                        mastery_delta=all_mastery_delta,
+                        is_correct=any_correct,
+                    )
+
+                # 6.5 生成复习任务
+                for diag in diagnoses:
+                    if diag.get("error_category"):
+                        tasks = await mastery_service.create_review_tasks_from_diagnosis(
+                            db=session,
+                            user_id=USER_ID,
+                            diagnosis=diag,
+                        )
+                        review_tasks.extend(tasks)
+
+                # 6.6 获取薄弱知识点
+                weak_points = await mastery_service.get_weak_points(
+                    db=session,
+                    user_id=USER_ID,
+                    limit=5,
+                )
+
+                await session.commit()
+                logger.info(f"[test/submit] persisted session={session_id}")
+
+        except Exception as e:
+            logger.error(f"[test/submit] persist error: {e}", exc_info=True)
+
+    # ========== Step 7: 生成 summary ==========
     avg_score = sum(scores) / len(scores) if scores else 0
     wrong_count = sum(1 for e in enriched_evals if not e["correct"])
 
@@ -320,40 +499,26 @@ async def submit_test(req: SubmitRequest) -> dict:
         top_tags = [et["tag"] for et in error_tags[:3]]
         summary += f" 薄弱知识点：{'、'.join(top_tags)}。"
 
-    # 6. 持久化（可选，没 PG 就跳过）
-    session_id = None
-    if used_db:
-        try:
-            async with async_session_factory() as session:
-                test_session = TestSession(
-                    title=f"Test-{datetime.utcnow().strftime('%Y%m%d-%H%M')}",
-                    total_questions=len(eval_tasks),
-                    completed_questions=len(req.answers),
-                    score=round(avg_score, 1),
-                    status="completed",
-                    completed_at=datetime.utcnow(),
-                )
-                session.add(test_session)
-                await session.flush()
-                session_id = str(test_session.id)
-                await session.commit()
-                logger.info(f"[test/submit] persisted session={session_id}")
-        except Exception as e:
-            logger.error(f"[test/submit] persist error: {e}")
-
-    return {
+    # ========== Step 8: 构建响应 ==========
+    response = {
         "score": round(avg_score, 1),
         "summary": summary,
         "details": details,
         "errorTags": error_tags,
+        "sessionId": session_id,
+        "diagnoses": diagnoses,
+        "masteryUpdates": mastery_updates,
+        "reviewTasks": review_tasks,
+        "weakPoints": weak_points,
     }
+
+    return response
 
 
 @router.get("/sessions")
 async def list_sessions():
     """获取测试会话列表"""
     try:
-        from app.database import async_session_factory
         async with async_session_factory() as session:
             result = await session.execute(
                 select(TestSession).order_by(TestSession.started_at.desc()).limit(20)
@@ -363,6 +528,7 @@ async def list_sessions():
                 {
                     "id": str(s.id),
                     "title": s.title,
+                    "mode": s.mode,
                     "total_questions": s.total_questions,
                     "completed_questions": s.completed_questions,
                     "score": s.score,
@@ -373,10 +539,12 @@ async def list_sessions():
                 for s in sessions
             ]
     except Exception as e:
+        logger.warning(f"[test/sessions] DB error: {e}")
         return [
             {
                 "id": "7d0c831e-d845-45d7-a69c-473791e14a45",
                 "title": "Python 面试模拟 #1",
+                "mode": "learn",
                 "total_questions": 5,
                 "completed_questions": 2,
                 "score": None,
@@ -389,11 +557,55 @@ async def list_sessions():
 
 @router.get("/sessions/{session_id}")
 async def get_session(session_id: str):
-    """获取单个测试会话"""
+    """获取单个测试会话详情"""
+    try:
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(TestSession).where(TestSession.id == session_id)
+            )
+            s = result.scalar_one_or_none()
+            if s:
+                return {
+                    "id": str(s.id),
+                    "title": s.title,
+                    "mode": s.mode,
+                    "total_questions": s.total_questions,
+                    "completed_questions": s.completed_questions,
+                    "score": s.score,
+                    "status": s.status,
+                    "started_at": s.started_at.isoformat() if s.started_at else None,
+                    "completed_at": s.completed_at.isoformat() if s.completed_at else None,
+                }
+    except Exception as e:
+        logger.warning(f"[test/session] DB error: {e}")
     return {"id": session_id, "message": "stub"}
 
 
 @router.get("/sessions/{session_id}/answers")
 async def list_answers(session_id: str):
-    """获取会话的所有回答"""
+    """获取会话的所有作答记录（含诊断）"""
+    try:
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(TestAnswer)
+                .where(TestAnswer.session_id == session_id)
+                .order_by(TestAnswer.created_at.asc())
+            )
+            answers = result.scalars().all()
+            return [
+                {
+                    "id": str(a.id),
+                    "question_id": str(a.question_id),
+                    "answer_text": a.answer_text,
+                    "is_correct": a.is_correct,
+                    "score": a.score,
+                    "error_type": a.error_type,
+                    "feedback": a.feedback,
+                    "error_tags": a.error_tags,
+                    "created_at": a.created_at.isoformat() if a.created_at else None,
+                }
+                for a in answers
+            ]
+    except Exception as e:
+        logger.warning(f"[test/answers] DB error: {e}")
     return []

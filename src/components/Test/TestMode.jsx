@@ -1,16 +1,21 @@
 import React, { useState, useEffect } from 'react';
-import { ArrowRight, Code, Check, X, Loader2 } from 'lucide-react';
+import { ArrowRight, Code, Check, X, Loader2, Brain, Target, BookOpen, RefreshCw } from 'lucide-react';
 import useAppStore from '../../store/useAppStore';
 
 /**
  * TestMode —— 测试模式考试界面
- * 对接真实后端 API（不再使用 mock 数据）
+ * 对接真实后端 API，包含完整学习闭环：
+ * 答题 → 评判 → 诊断 → 掌握度更新 → 复习任务生成
  */
 export default function TestMode() {
   const activeFile = useAppStore((s) => s.activeFile);
   const setViewMode = useAppStore((s) => s.setViewMode);
   const openRightDrawer = useAppStore((s) => s.openRightDrawer);
   const setErrorTags = useAppStore((s) => s.setErrorTags);
+  const setDiagnoses = useAppStore((s) => s.setDiagnoses);
+  const setMasteryUpdates = useAppStore((s) => s.setMasteryUpdates);
+  const setReviewTasks = useAppStore((s) => s.setReviewTasks);
+  const setWeakPoints = useAppStore((s) => s.setWeakPoints);
 
   const [answers, setAnswers] = useState({});
   const [submitted, setSubmitted] = useState(false);
@@ -89,6 +94,12 @@ export default function TestMode() {
       if (data.errorTags && data.errorTags.length > 0) {
         setErrorTags(data.errorTags);
       }
+
+      // 保存学习闭环数据到 store
+      if (data.diagnoses) setDiagnoses(data.diagnoses);
+      if (data.masteryUpdates) setMasteryUpdates(data.masteryUpdates);
+      if (data.reviewTasks) setReviewTasks(data.reviewTasks);
+      if (data.weakPoints) setWeakPoints(data.weakPoints);
 
       // 打开右侧抽屉展示结果
       openRightDrawer();
@@ -173,6 +184,11 @@ export default function TestMode() {
 
   // ---- 已提交，显示结果摘要 ----
   if (submitted && feedback) {
+    const hasDiagnoses = feedback.diagnoses && feedback.diagnoses.length > 0;
+    const hasReviewTasks = feedback.reviewTasks && feedback.reviewTasks.length > 0;
+    const hasMasteryUpdates = feedback.masteryUpdates && Object.keys(feedback.masteryUpdates).length > 0;
+    const hasWeakPoints = feedback.weakPoints && feedback.weakPoints.length > 0;
+
     return (
       <div className="max-w-2xl mx-auto py-10 px-6">
         <div className="text-center mb-8">
@@ -185,7 +201,12 @@ export default function TestMode() {
           <p className="text-surface-500 dark:text-surface-400">{feedback.summary}</p>
         </div>
 
+        {/* 答题详情 */}
         <div className="space-y-4 mb-8">
+          <h3 className="text-lg font-semibold text-surface-800 dark:text-surface-200 flex items-center gap-2">
+            <Check size={18} className="text-primary-500" />
+            答题详情
+          </h3>
           {feedback.details.map((d, i) => (
             <div
               key={d.questionId}
@@ -214,6 +235,156 @@ export default function TestMode() {
             </div>
           ))}
         </div>
+
+        {/* 能力诊断 */}
+        {hasDiagnoses && (
+          <div className="space-y-4 mb-8">
+            <h3 className="text-lg font-semibold text-surface-800 dark:text-surface-200 flex items-center gap-2">
+              <Brain size={18} className="text-purple-500" />
+              能力诊断
+            </h3>
+            {feedback.diagnoses.map((diag, i) => (
+              diag.error_category && (
+                <div key={i} className="test-card border-l-4 border-l-purple-500">
+                  <div className="mb-2">
+                    <span className="inline-block text-xs bg-purple-50 dark:bg-purple-950 text-purple-600 dark:text-purple-400 px-2 py-0.5 rounded-full font-medium">
+                      {diag.error_category}
+                    </span>
+                  </div>
+                  <p className="text-sm text-surface-700 dark:text-surface-300 mb-2">
+                    {diag.error_conclusion}
+                  </p>
+                  {diag.review_suggestions && diag.review_suggestions.length > 0 && (
+                    <div className="mt-3 pt-3 border-t border-surface-200 dark:border-surface-700">
+                      <p className="text-xs text-surface-500 dark:text-surface-400 mb-2">复习建议：</p>
+                      <ul className="space-y-1.5">
+                        {diag.review_suggestions.slice(0, 3).map((s, j) => (
+                          <li key={j} className="flex items-start gap-2 text-sm text-surface-600 dark:text-surface-400">
+                            <BookOpen size={14} className="text-primary-500 mt-0.5 flex-shrink-0" />
+                            <span>{s.title}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )
+            ))}
+          </div>
+        )}
+
+        {/* 掌握度变化 */}
+        {hasMasteryUpdates && (
+          <div className="space-y-4 mb-8">
+            <h3 className="text-lg font-semibold text-surface-800 dark:text-surface-200 flex items-center gap-2">
+              <Target size={18} className="text-blue-500" />
+              掌握度变化
+            </h3>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {Object.entries(feedback.masteryUpdates).slice(0, 4).map(([kpId, update]) => (
+                <div key={kpId} className="test-card">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-sm font-medium text-surface-700 dark:text-surface-300">
+                      {update.kp_name || kpId.slice(0, 8)}
+                    </span>
+                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                      update.status === 'mastered' ? 'bg-green-50 text-green-600 dark:bg-green-950 dark:text-green-400' :
+                      update.status === 'unstable' ? 'bg-yellow-50 text-yellow-600 dark:bg-yellow-950 dark:text-yellow-400' :
+                      update.status === 'learning' ? 'bg-blue-50 text-blue-600 dark:bg-blue-950 dark:text-blue-400' :
+                      update.status === 'forgotten' ? 'bg-orange-50 text-orange-600 dark:bg-orange-950 dark:text-orange-400' :
+                      'bg-gray-50 text-gray-600 dark:bg-gray-950 dark:text-gray-400'
+                    }`}>
+                      {update.status === 'mastered' ? '已掌握' :
+                       update.status === 'unstable' ? '掌握不稳' :
+                       update.status === 'learning' ? '学习中' :
+                       update.status === 'forgotten' ? '已遗忘' : '未学习'}
+                    </span>
+                  </div>
+                  <div className="w-full h-2 bg-surface-200 dark:bg-surface-700 rounded-full mb-1">
+                    <div
+                      className="h-full bg-primary-500 rounded-full transition-all duration-500"
+                      style={{ width: `${update.mastery_score}%` }}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between text-xs text-surface-500 dark:text-surface-400">
+                    <span>{update.mastery_score} 分</span>
+                    {update.delta !== undefined && (
+                      <span className={update.delta >= 0 ? 'text-green-500' : 'text-red-500'}>
+                        {update.delta >= 0 ? '+' : ''}{update.delta}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* 复习任务 */}
+        {hasReviewTasks && (
+          <div className="space-y-4 mb-8">
+            <h3 className="text-lg font-semibold text-surface-800 dark:text-surface-200 flex items-center gap-2">
+              <RefreshCw size={18} className="text-amber-500" />
+              复习任务
+            </h3>
+            <div className="space-y-2">
+              {feedback.reviewTasks.slice(0, 5).map((task, i) => (
+                <div key={i} className="test-card flex items-start gap-3">
+                  <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
+                    task.task_type === 'review_material' ? 'bg-blue-50 text-blue-500 dark:bg-blue-950 dark:text-blue-400' :
+                    task.task_type === 'practice_question' ? 'bg-green-50 text-green-500 dark:bg-green-950 dark:text-green-400' :
+                    task.task_type === 'concept_comparison' ? 'bg-purple-50 text-purple-500 dark:bg-purple-950 dark:text-purple-400' :
+                    'bg-amber-50 text-amber-500 dark:bg-amber-950 dark:text-amber-400'
+                  }`}>
+                    <BookOpen size={16} />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-surface-700 dark:text-surface-300">
+                      {task.title}
+                    </p>
+                    {task.description && (
+                      <p className="text-xs text-surface-500 dark:text-surface-400 mt-0.5">
+                        {task.description}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* 薄弱知识点 */}
+        {hasWeakPoints && (
+          <div className="space-y-4 mb-8">
+            <h3 className="text-lg font-semibold text-surface-800 dark:text-surface-200 flex items-center gap-2">
+              <Target size={18} className="text-red-500" />
+              当前薄弱知识点
+            </h3>
+            <div className="space-y-2">
+              {feedback.weakPoints.slice(0, 5).map((wp, i) => (
+                <div key={i} className="test-card flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium text-surface-700 dark:text-surface-300">
+                      {wp.kp_name || wp.kp_id}
+                    </p>
+                    <p className="text-xs text-surface-500 dark:text-surface-400">
+                      错误 {wp.wrong_count || 0} 次
+                    </p>
+                  </div>
+                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                    wp.status === 'unstable' ? 'bg-yellow-50 text-yellow-600 dark:bg-yellow-950 dark:text-yellow-400' :
+                    wp.status === 'learning' ? 'bg-blue-50 text-blue-600 dark:bg-blue-950 dark:text-blue-400' :
+                    wp.status === 'forgotten' ? 'bg-orange-50 text-orange-600 dark:bg-orange-950 dark:text-orange-400' :
+                    'bg-gray-50 text-gray-600 dark:bg-gray-950 dark:text-gray-400'
+                  }`}>
+                    {wp.mastery_score} 分
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="flex gap-3 justify-center">
           <button
