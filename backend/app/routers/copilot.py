@@ -133,8 +133,8 @@ async def explain(request: ExplainRequest):
             # 检查 chromadb 是否可用（lazy import 会失败 → 立即降级）
             from app.services.copilot import explain_stream
             # 确认 LLM 可用
-            from app.services.llm import llm_client
-            if not llm_client.is_available():
+            from app.services.llm import is_available
+            if not is_available():
                 raise RuntimeError("LLM unavailable")
             tried_main = True
             async for token in explain_stream(

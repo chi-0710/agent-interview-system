@@ -362,6 +362,9 @@ async def submit_test(req: SubmitRequest) -> dict:
         })
 
         # ---- 能力诊断 ----
+        # 评判服务不可用时，跳过诊断（避免将系统故障误判为用户答错）
+        is_eval_unavailable = result_dict.get("error_type") in ("评判失败", "评判异常")
+
         kps_for_q = question_kps.get(str(q.get("id")), [])
         eval_with_answer = {**result_dict, "user_answer": ans.user_answer}
 
@@ -371,6 +374,7 @@ async def submit_test(req: SubmitRequest) -> dict:
             knowledge_points=kps_for_q,
             common_mistakes=q.get("common_mistakes"),
         )
+        diag_result["_eval_unavailable"] = is_eval_unavailable
         diagnoses.append({
             "questionId": ans.question_id,
             **diag_result,
@@ -449,6 +453,7 @@ async def submit_test(req: SubmitRequest) -> dict:
 
                 # 6.4 更新用户掌握度（逐题逐知识点，不是整场聚合）
                 # 关键：每道题单独更新，正确的题加分+增加streak，错误的题扣分+重置streak
+                # 评判不可用（error_type=="评判失败"）时跳过，不写入掌握度
                 mastery_updates = {}
                 for diag in diagnoses:
                     qid = diag["questionId"]
@@ -458,6 +463,11 @@ async def submit_test(req: SubmitRequest) -> dict:
 
                     mastery_delta = diag.get("mastery_delta", {})
                     if not mastery_delta:
+                        continue
+
+                    # 评判服务不可用时，不更新掌握度（避免误判为答错）
+                    if diag.get("_eval_unavailable"):
+                        logger.warning(f"[test/submit] skipping mastery update for qid={qid}: evaluator unavailable")
                         continue
 
                     # 本题的诊断结果
@@ -497,7 +507,7 @@ async def submit_test(req: SubmitRequest) -> dict:
                     )
 
                 for diag in diagnoses:
-                    if diag.get("error_category"):
+                    if diag.get("error_category") and not diag.get("_eval_unavailable"):
                         question_id = diag.get("questionId")
                         diagnosis_id = diagnosis_ids.get(question_id)
 

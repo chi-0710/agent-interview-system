@@ -135,6 +135,21 @@ npm run build
 
 开发服务器默认运行在 `http://localhost:3000`，后端 API 默认在 `http://localhost:8000`。
 
+### Docker Compose（一键部署）
+
+```bash
+# 启动全部服务（PostgreSQL + 后端 + 前端）
+docker compose up -d
+
+# 注入种子数据
+docker compose exec backend python scripts/seed_questions.py
+
+# 查看日志
+docker compose logs -f backend
+```
+
+前端通过 Vite 代理访问后端。本地开发时代理到 `http://localhost:8000`，Docker Compose 中通过 `VITE_API_PROXY_TARGET=http://backend:8000` 环境变量自动切换。
+
 ## 项目结构
 
 ### 前端
@@ -286,16 +301,14 @@ Question ── QuestionKnowledgeLink ─┘
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/learning/mastery` | 获取用户掌握度列表（支持分类、状态筛选） |
-| GET | `/api/learning/mastery/{kp_id}` | 获取单个知识点掌握详情 |
-| GET | `/api/learning/weak-points` | 获取薄弱知识点 |
-| GET | `/api/learning/review-tasks` | 获取复习任务列表 |
+| GET | `/api/learning/mastery` | 获取用户掌握度列表（支持 category、status 筛选） |
+| GET | `/api/learning/weak-points` | 获取薄弱知识点（limit 参数） |
+| GET | `/api/learning/review-tasks` | 获取复习任务列表（支持 status 筛选） |
 | POST | `/api/learning/review-tasks/{id}/complete` | 标记复习任务完成 |
-| GET | `/api/learning/knowledge-tree` | 获取知识点树 |
-| GET | `/api/learning/knowledge-points/{id}` | 获取知识点详情 |
-| **POST** | **`/api/learning/next-session`** | **生成下一个自适应练习会话** |
+| POST | `/api/learning/next-session` | 生成下一个自适应练习会话 |
 | GET | `/api/learning/sessions` | 练习会话列表 |
 | GET | `/api/learning/plans` | 学习计划列表 |
+| POST | `/api/learning/plans` | 创建学习计划 |
 
 ### 测试 API
 

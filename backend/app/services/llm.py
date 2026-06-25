@@ -25,6 +25,10 @@ def _get_client() -> AsyncOpenAI:
     return _client
 
 
+def is_available() -> bool:
+    return bool(settings.openai_api_key)
+
+
 async def stream_chat(
     messages: list[dict],
     model: Optional[str] = None,
