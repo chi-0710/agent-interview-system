@@ -276,7 +276,7 @@ class LearningService:
                     for prereq_id in prereq_map[kp_id]:
                         prereq_mastery = mastery_map.get(prereq_id)
                         if not prereq_mastery or prereq_mastery.status in ("learning", "unknown", "forgotten"):
-                            score += 0.5  # 前置没掌握，优先级略降（先学前置）
+                            score += 0.5  # 前置未掌握，提高目标题优先级（暴露知识缺口）
                             info["has_weak_prereq"] = True
                             break
 

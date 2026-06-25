@@ -253,6 +253,37 @@ class MasteryService:
         await db.flush()
         return results
 
+    async def refresh_all_user_mastery(
+        self,
+        db: AsyncSession,
+        user_id: str,
+    ) -> List[UserMastery]:
+        """刷新某用户的所有掌握度时间衰减状态，返回所有记录（含已刷新的）
+
+        与 get_user_mastery_list 的区别：先全量刷新，再返回。
+        保证 /mastery、/weak-points、/next-session 拿到同一份有效状态。
+        """
+        result = await db.execute(
+            select(UserMastery).where(UserMastery.user_id == user_id)
+        )
+        masteries = result.scalars().all()
+
+        now = datetime.utcnow()
+        changed = False
+        for m in masteries:
+            old_status = m.status
+            new_status = self.refresh_time_decay(m, now=now)
+            if old_status != new_status:
+                m.status = new_status
+                m.confidence = self._calculate_confidence(m)
+                m.review_due_at = self._calculate_review_due(m)
+                changed = True
+
+        if changed:
+            await db.flush()
+
+        return list(masteries)
+
     async def get_user_mastery_list(
         self,
         db: AsyncSession,
@@ -263,28 +294,19 @@ class MasteryService:
     ) -> List[dict]:
         """获取用户所有知识点的掌握情况
 
-        Args:
-            refresh: 是否先刷新状态（检查遗忘等）
+        先刷新时间衰减状态，再按 status 筛选。
         """
-        query = select(UserMastery).where(UserMastery.user_id == user_id)
-
-        if status:
-            query = query.where(UserMastery.status == status)
-
-        result = await db.execute(query)
-        masteries = result.scalars().all()
-
-        # 读取时刷新状态（检查遗忘）
-        if refresh and masteries:
-            now = datetime.utcnow()
-            for m in masteries:
-                old_status = m.status
-                new_status = self.refresh_time_decay(m, now=now)
-                if old_status != new_status:
-                    logger.info(f"[mastery/refresh] kp={m.knowledge_point_id}: {old_status} → {new_status}")
-                    m.status = new_status
-                    m.confidence = self._calculate_confidence(m)
-                    m.review_due_at = self._calculate_review_due(m)
+        if refresh:
+            masteries = await self.refresh_all_user_mastery(db, user_id)
+            # 在内存中按 status 筛选
+            if status:
+                masteries = [m for m in masteries if m.status == status]
+        else:
+            query = select(UserMastery).where(UserMastery.user_id == user_id)
+            if status:
+                query = query.where(UserMastery.status == status)
+            result = await db.execute(query)
+            masteries = list(result.scalars().all())
 
         # 关联知识点信息
         kp_ids = [str(m.knowledge_point_id) for m in masteries]
@@ -328,17 +350,12 @@ class MasteryService:
         user_id: str,
         limit: int = 10,
     ) -> List[dict]:
-        """获取用户最薄弱的知识点列表"""
-        result = await db.execute(
-            select(UserMastery)
-            .where(
-                UserMastery.user_id == user_id,
-                UserMastery.status.in_(["learning", "unstable", "forgotten"]),
-            )
-            .order_by(UserMastery.mastery_score.asc())
-            .limit(limit)
-        )
-        masteries = result.scalars().all()
+        """获取用户最薄弱的知识点列表（先刷新时间衰减）"""
+        all_masteries = await self.refresh_all_user_mastery(db, user_id)
+        masteries = [m for m in all_masteries
+                     if m.status in ("learning", "unstable", "forgotten")]
+        masteries.sort(key=lambda m: m.mastery_score)
+        masteries = masteries[:limit]
 
         kp_ids = [str(m.knowledge_point_id) for m in masteries]
         if kp_ids:

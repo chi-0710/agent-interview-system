@@ -144,6 +144,7 @@ async def get_mastery_list(
                 category=category,
                 status=status,
             )
+            await session.commit()
             return data
     except Exception as e:
         logger.error(f"[learning/mastery] error: {e}", exc_info=True)
@@ -182,6 +183,7 @@ async def get_weak_points(limit: int = Query(10)):
                 user_id=USER_ID,
                 limit=limit,
             )
+            await session.commit()
             return data
     except Exception as e:
         logger.error(f"[learning/weak-points] error: {e}", exc_info=True)

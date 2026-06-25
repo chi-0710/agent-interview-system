@@ -95,11 +95,13 @@ export default function TestMode() {
         setErrorTags(data.errorTags);
       }
 
-      // 保存学习闭环数据到 store
-      if (data.diagnoses) setDiagnoses(data.diagnoses);
-      if (data.masteryUpdates) setMasteryUpdates(data.masteryUpdates);
-      if (data.reviewTasks) setReviewTasks(data.reviewTasks);
-      if (data.weakPoints) setWeakPoints(data.weakPoints);
+      // 保存学习闭环数据到 store（仅持久化成功时）
+      if (data.persistenceStatus !== 'failed') {
+        if (data.diagnoses) setDiagnoses(data.diagnoses);
+        if (data.masteryUpdates) setMasteryUpdates(data.masteryUpdates);
+        if (data.reviewTasks) setReviewTasks(data.reviewTasks);
+        if (data.weakPoints) setWeakPoints(data.weakPoints);
+      }
 
       // 打开右侧抽屉展示结果
       openRightDrawer();
