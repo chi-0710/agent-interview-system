@@ -199,6 +199,15 @@ export default function TestMode() {
           </div>
           <h2 className="text-2xl font-bold text-surface-900 dark:text-surface-100 mb-2">测试完成</h2>
           <p className="text-surface-500 dark:text-surface-400">{feedback.summary}</p>
+
+          {feedback.persistenceStatus === 'failed' && (
+            <div className="mt-4 p-3 bg-amber-50 dark:bg-amber-950 border border-amber-300 dark:border-amber-800 rounded-lg text-left" role="alert">
+              <p className="text-amber-800 dark:text-amber-200 text-sm font-medium">⚠️ 学习记录未保存</p>
+              <p className="text-amber-700 dark:text-amber-300 text-xs mt-1">
+                {feedback.persistenceMessage || '本次答案已完成评判，但学习记录暂未保存。请稍后重试。'}
+              </p>
+            </div>
+          )}
         </div>
 
         {/* 答题详情 */}

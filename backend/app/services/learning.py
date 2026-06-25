@@ -251,12 +251,11 @@ class LearningService:
 
                 # 低掌握度权重
                 if mastery:
-                    if mastery.status == "learning":
-                        score += 2.0 * (1.0 - min(mastery.mastery_score / 50.0, 1.0))
-                    elif mastery.status == "forgotten":
+                    if mastery.status == "forgotten":
                         score += 2.0
+                    elif mastery.status in ("learning", "unstable"):
+                        score += 2.0 * (1.0 - min((mastery.mastery_score or 0) / 70.0, 1.0))
                 else:
-                    # 未学习过的知识点也给一定优先级
                     score += 0.8
 
                 # 高重要性权重
