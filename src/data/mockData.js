@@ -34,6 +34,21 @@ export const mockFileTree = [
   },
 ];
 
+// ---- 知识库列表 ----
+export const mockKnowledgeBases = [
+  {
+    id: 'default',
+    name: '默认知识库',
+    description: '系统预置知识库',
+    tags: [],
+    status: 'ready',
+    document_count: 2,
+    chunk_count: 48,
+    created_at: '',
+    updated_at: '',
+  },
+];
+
 // ---- Markdown 文档内容 ----
 export const mockMarkdownContent = {
   '/docs/cs/os-memory.md': `# 操作系统内存管理

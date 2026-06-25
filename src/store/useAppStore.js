@@ -54,6 +54,105 @@ const useAppStore = create((set, get) => ({
   openRightDrawer: () => set({ rightDrawerOpen: true }),
   closeRightDrawer: () => set({ rightDrawerOpen: false }),
 
+  // ========== 知识库 ==========
+  knowledgeBases: [],
+  activeKnowledgeBaseId: 'default',
+  activeFileTree: null,
+  showCreateKBModal: false,
+  showImportProgress: false,
+  importJob: null,
+
+  setKnowledgeBases: (bases) => set({ knowledgeBases: bases }),
+  setActiveKnowledgeBase: (id) =>
+    set({
+      activeKnowledgeBaseId: id,
+      activeFile: null,
+      activeFileTree: null,
+    }),
+  setShowCreateKBModal: (v) => set({ showCreateKBModal: v }),
+  setShowImportProgress: (v) => set({ showImportProgress: v }),
+  setImportJob: (job) => set({ importJob: job }),
+  setActiveFileTree: (tree) => set({ activeFileTree: tree }),
+
+  loadKnowledgeBases: async () => {
+    try {
+      const resp = await fetch('/api/knowledge-bases');
+      if (resp.ok) {
+        const data = await resp.json();
+        set({ knowledgeBases: data });
+        return data;
+      }
+    } catch (e) {
+      console.error('[store] load knowledge bases failed:', e);
+    }
+    return [];
+  },
+
+  createKnowledgeBase: async (payload) => {
+    const resp = await fetch('/api/knowledge-bases', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || '创建失败');
+    }
+    const kb = await resp.json();
+    set((s) => ({ knowledgeBases: [...s.knowledgeBases, kb] }));
+    return kb;
+  },
+
+  uploadDocuments: async (knowledgeBaseId, files) => {
+    const formData = new FormData();
+    files.forEach((f) => formData.append('files', f));
+    const resp = await fetch(`/api/knowledge-bases/${knowledgeBaseId}/documents`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || '上传失败');
+    }
+    return resp.json();
+  },
+
+  getImportJob: async (knowledgeBaseId, jobId) => {
+    const resp = await fetch(`/api/knowledge-bases/${knowledgeBaseId}/jobs/${jobId}`);
+    if (!resp.ok) return null;
+    return resp.json();
+  },
+
+  loadKnowledgeBaseTree: async (knowledgeBaseId) => {
+    try {
+      const resp = await fetch(`/api/knowledge-bases/${knowledgeBaseId}/tree`);
+      if (resp.ok) {
+        const data = await resp.json();
+        set({ activeFileTree: data });
+        return data;
+      }
+    } catch (e) {
+      console.error('[store] load kb tree failed:', e);
+    }
+    return null;
+  },
+
+  deleteKnowledgeBase: async (knowledgeBaseId) => {
+    const resp = await fetch(`/api/knowledge-bases/${knowledgeBaseId}`, {
+      method: 'DELETE',
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || '删除失败');
+    }
+    set((s) => ({
+      knowledgeBases: s.knowledgeBases.filter((kb) => kb.id !== knowledgeBaseId),
+      activeKnowledgeBaseId: s.activeKnowledgeBaseId === knowledgeBaseId ? 'default' : s.activeKnowledgeBaseId,
+      activeFile: s.activeKnowledgeBaseId === knowledgeBaseId ? null : s.activeFile,
+    }));
+    return true;
+  },
+
   // ========== 选区监听 ==========
   /** @type {{ text: string; x: number; y: number } | null} */
   selection: null,

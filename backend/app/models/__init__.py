@@ -10,6 +10,52 @@ class Base(DeclarativeBase):
     pass
 
 
+# ============== 知识库 ==============
+
+class KnowledgeBase(Base):
+    """知识库 - 独立的学习空间，包含文档、切片、向量索引、知识点"""
+    __tablename__ = "knowledge_bases"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(200), nullable=False)
+    description = Column(Text, nullable=True)
+    tags = Column(JSON, nullable=True)
+    owner_id = Column(String(100), nullable=False, default="default_user")
+    status = Column(String(30), default="draft")
+
+    document_count = Column(Integer, default=0)
+    chunk_count = Column(Integer, default=0)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    documents = relationship("Document", back_populates="knowledge_base", cascade="all, delete-orphan")
+    import_jobs = relationship("ImportJob", back_populates="knowledge_base", cascade="all, delete-orphan")
+
+
+class ImportJob(Base):
+    """知识库导入任务 - 追踪批量文件导入进度"""
+    __tablename__ = "import_jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    knowledge_base_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False)
+    status = Column(String(30), default="queued")
+
+    total_files = Column(Integer, default=0)
+    completed_files = Column(Integer, default=0)
+    failed_files = Column(Integer, default=0)
+    current_step = Column(String(50), nullable=True)
+    progress_percent = Column(Integer, default=0)
+
+    file_details = Column(JSON, nullable=True)
+
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    knowledge_base = relationship("KnowledgeBase", back_populates="import_jobs")
+
+
 # ============== 文档与内容 ==============
 
 class Document(Base):
@@ -17,6 +63,7 @@ class Document(Base):
     __tablename__ = "documents"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    knowledge_base_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=True, index=True)
     title = Column(String(500), nullable=False)
     content = Column(Text, nullable=False)
     file_type = Column(String(50), nullable=False)  # pdf, docx, txt, md
@@ -24,6 +71,7 @@ class Document(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
+    knowledge_base = relationship("KnowledgeBase", back_populates="documents")
     questions = relationship("Question", back_populates="document", cascade="all, delete-orphan")
     chunks = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan")
 
@@ -57,6 +105,7 @@ class KnowledgePoint(Base):
     __tablename__ = "knowledge_points"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    knowledge_base_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=True, index=True)
     name = Column(String(200), nullable=False)  # 知识点名称，如 "TLB"
     description = Column(Text, nullable=True)   # 简要描述
     parent_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_points.id", ondelete="SET NULL"), nullable=True)

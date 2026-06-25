@@ -21,6 +21,7 @@ class Settings(BaseSettings):
 
     # Docs
     docs_dir: str = ""
+    uploads_dir: str = ""
 
     # CORS
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
@@ -35,9 +36,17 @@ class Settings(BaseSettings):
         """获取 docs 目录的绝对路径"""
         if self.docs_dir and os.path.isdir(self.docs_dir):
             return os.path.abspath(self.docs_dir)
-        # 默认：backend/docs/
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return os.path.join(base, "docs")
+
+    def get_uploads_dir(self) -> str:
+        """获取上传文件目录的绝对路径"""
+        if self.uploads_dir and os.path.isdir(self.uploads_dir):
+            return os.path.abspath(self.uploads_dir)
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        uploads = os.path.join(base, "uploads")
+        os.makedirs(uploads, exist_ok=True)
+        return uploads
 
 
 @lru_cache()

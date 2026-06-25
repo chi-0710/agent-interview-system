@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   PanelLeftClose,
   PanelLeftOpen,
@@ -6,13 +6,15 @@ import {
   FileText,
   Flame,
   CheckCircle2,
+  Library,
+  Plus,
+  ChevronDown,
+  ChevronRight,
+  Trash2,
 } from 'lucide-react';
 import useAppStore from '../../store/useAppStore';
 import { mockFileTree } from '../../data/mockData';
 
-/**
- * 将后端返回的文件树节点格式标准化为前端所需格式
- */
 function normalizeTree(nodes) {
   return nodes.map((node) => ({
     ...node,
@@ -20,13 +22,10 @@ function normalizeTree(nodes) {
   }));
 }
 
-/**
- * FileTreeNode - 递归渲染文件树节点
- */
 function FileTreeNode({ node, depth = 0 }) {
   const activeFile = useAppStore((s) => s.activeFile);
   const setActiveFile = useAppStore((s) => s.setActiveFile);
-  const [expanded, setExpanded] = React.useState(true);
+  const [expanded, setExpanded] = useState(true);
 
   const isActive = activeFile?.id === node.id;
   const paddingLeft = 12 + depth * 16;
@@ -41,6 +40,11 @@ function FileTreeNode({ node, depth = 0 }) {
                      transition-colors"
           style={{ paddingLeft }}
         >
+          {expanded ? (
+            <ChevronDown size={12} className="mr-1 flex-shrink-0" />
+          ) : (
+            <ChevronRight size={12} className="mr-1 flex-shrink-0" />
+          )}
           <Folder size={14} className="mr-1.5 flex-shrink-0" />
           <span className="truncate font-medium">{node.title}</span>
         </button>
@@ -52,7 +56,6 @@ function FileTreeNode({ node, depth = 0 }) {
     );
   }
 
-  // file
   const statusIcon =
     node.status === 'hot' ? (
       <Flame size={12} className="text-red-500 ml-auto" />
@@ -77,34 +80,208 @@ function FileTreeNode({ node, depth = 0 }) {
   );
 }
 
-/**
- * LeftSidebar - 左侧知识库导航栏
- *
- * 特性：
- * - IDE 风格文件树
- * - 文件状态指示器（🔥高频错题 / ✅已通过）
- * - 可折叠，给阅读模式提供纯净视野
- */
+function KnowledgeBaseTreeItem({ kb, isActive, onClick, onDelete }) {
+  const [showDelete, setShowDelete] = useState(false);
+
+  return (
+    <div
+      className="group relative"
+      onMouseEnter={() => setShowDelete(true)}
+      onMouseLeave={() => setShowDelete(false)}
+    >
+      <button
+        onClick={onClick}
+        className={`flex items-center w-full px-3 py-2 text-sm transition-colors
+          ${isActive
+            ? 'bg-primary-50 dark:bg-primary-950 text-primary-700 dark:text-primary-300 border-r-2 border-primary-500'
+            : 'text-surface-600 dark:text-surface-400 hover:bg-surface-100 dark:hover:bg-surface-800 hover:text-surface-800 dark:hover:text-surface-200'
+          }`}
+      >
+        <Library size={14} className="mr-2 flex-shrink-0" />
+        <div className="flex-1 text-left min-w-0">
+          <div className="truncate font-medium text-xs">{kb.name}</div>
+          <div className="text-[10px] text-surface-400 dark:text-surface-500 truncate">
+            {kb.document_count || 0} 篇文档
+            {kb.status === 'ready' && ' · 就绪'}
+            {kb.status === 'processing' && ' · 处理中'}
+            {kb.status === 'draft' && ' · 草稿'}
+            {kb.status === 'failed' && ' · 失败'}
+          </div>
+        </div>
+        {showDelete && kb.id !== 'default' && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete(kb.id);
+            }}
+            className="p-0.5 rounded text-surface-400 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all"
+            title="删除知识库"
+          >
+            <Trash2 size={12} />
+          </button>
+        )}
+      </button>
+    </div>
+  );
+}
+
+function KnowledgeBaseFileTree({ knowledgeBaseId }) {
+  const activeFile = useAppStore((s) => s.activeFile);
+  const setActiveFile = useAppStore((s) => s.setActiveFile);
+  const loadKnowledgeBaseTree = useAppStore((s) => s.loadKnowledgeBaseTree);
+  const [files, setFiles] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (knowledgeBaseId === 'default') {
+      fetch('/api/documents')
+        .then((r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.json();
+        })
+        .then((data) => {
+          if (Array.isArray(data) && data.length > 0) {
+            setFiles(normalizeTree(data));
+          } else {
+            setFiles(mockFileTree);
+          }
+        })
+        .catch(() => {
+          setFiles(mockFileTree);
+        });
+    } else {
+      setLoading(true);
+      loadKnowledgeBaseTree(knowledgeBaseId)
+        .then((data) => {
+          if (data && data.files && data.files.length > 0) {
+            const folders = {};
+            data.files.forEach((f) => {
+              const parts = (f.title || f.path || '').split(/[/\\]/).filter(Boolean);
+              let current = folders;
+              let depth = 0;
+              parts.forEach((part, i) => {
+                const isFile = i === parts.length - 1 && f.type === 'file';
+                if (isFile) {
+                  if (!current._files) current._files = [];
+                  current._files.push({
+                    ...f,
+                    title: f.title || part,
+                  });
+                } else {
+                  if (!current[part]) {
+                    current[part] = {};
+                  }
+                  current = current[part];
+                }
+              });
+            });
+
+            const buildTree = (obj, depth = 0) => {
+              const result = [];
+              const fileItems = obj._files || [];
+              const folderKeys = Object.keys(obj).filter((k) => k !== '_files');
+
+              folderKeys.forEach((key) => {
+                result.push({
+                  id: `${knowledgeBaseId}-${key}`,
+                  title: key,
+                  type: 'folder',
+                  children: buildTree(obj[key], depth + 1),
+                });
+              });
+
+              fileItems.forEach((f) => {
+                result.push({
+                  ...f,
+                  id: f.id || f.path || f.title,
+                });
+              });
+
+              return result;
+            };
+
+            const tree = buildTree(folders);
+
+            if (tree.length === 0) {
+              setFiles(
+                data.files.map((f) => ({
+                  ...f,
+                  id: f.id || f.path || f.title,
+                  type: 'file',
+                }))
+              );
+            } else if (tree.length === 1 && tree[0].type === 'file' && data.files.length > 1) {
+              setFiles(
+                data.files.map((f) => ({
+                  ...f,
+                  id: f.id || f.path || f.title,
+                  type: 'file',
+                }))
+              );
+            } else {
+              setFiles(tree);
+            }
+          } else {
+            setFiles([]);
+          }
+        })
+        .catch(() => {
+          setFiles([]);
+        })
+        .finally(() => {
+          setLoading(false);
+        });
+    }
+  }, [knowledgeBaseId]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-6">
+        <div className="w-4 h-4 border-2 border-primary-300 border-t-primary-600 rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  if (files.length === 0) {
+    return (
+      <div className="px-3 py-4 text-xs text-surface-400 dark:text-surface-500 text-center">
+        暂无文档
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {files.map((node) => (
+        <FileTreeNode key={node.id} node={node} />
+      ))}
+    </>
+  );
+}
+
 export default function LeftSidebar() {
   const collapsed = useAppStore((s) => s.leftSidebarCollapsed);
   const toggleLeftSidebar = useAppStore((s) => s.toggleLeftSidebar);
-  const [fileTree, setFileTree] = React.useState(mockFileTree);
+  const knowledgeBases = useAppStore((s) => s.knowledgeBases);
+  const activeKnowledgeBaseId = useAppStore((s) => s.activeKnowledgeBaseId);
+  const setActiveKnowledgeBase = useAppStore((s) => s.setActiveKnowledgeBase);
+  const setShowCreateKBModal = useAppStore((s) => s.setShowCreateKBModal);
+  const loadKnowledgeBases = useAppStore((s) => s.loadKnowledgeBases);
+  const deleteKnowledgeBase = useAppStore((s) => s.deleteKnowledgeBase);
 
-  React.useEffect(() => {
-    fetch('/api/documents')
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
-      .then((data) => {
-        if (Array.isArray(data) && data.length > 0) {
-          setFileTree(normalizeTree(data));
-        }
-      })
-      .catch(() => {
-        // 请求失败时保留 mock 数据，静默降级
-      });
+  useEffect(() => {
+    loadKnowledgeBases();
   }, []);
+
+  const handleDeleteKB = async (kbId) => {
+    if (!window.confirm('确定要删除该知识库吗？所有关联数据将被永久删除。')) return;
+    try {
+      await deleteKnowledgeBase(kbId);
+      await loadKnowledgeBases();
+    } catch (e) {
+      alert(e.message || '删除失败');
+    }
+  };
 
   if (collapsed) {
     return (
@@ -126,30 +303,54 @@ export default function LeftSidebar() {
   return (
     <div className="flex flex-col w-56 border-r border-surface-200 dark:border-surface-700
                     bg-white dark:bg-surface-900 shrink-0 transition-colors">
-      {/* Header */}
       <div className="flex items-center justify-between px-3 py-3 border-b border-surface-100 dark:border-surface-800">
         <span className="text-xs font-semibold text-surface-500 dark:text-surface-400 uppercase tracking-wider">
           知识库
         </span>
-        <button
-          onClick={toggleLeftSidebar}
-          className="p-1 rounded-md text-surface-400 dark:text-surface-500
-                     hover:text-surface-700 dark:hover:text-surface-200
-                     hover:bg-surface-100 dark:hover:bg-surface-800 transition-colors"
-          title="折叠导航"
-        >
-          <PanelLeftClose size={16} />
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => setShowCreateKBModal(true)}
+            className="p-1 rounded-md text-surface-400 dark:text-surface-500
+                       hover:text-primary-600 dark:hover:text-primary-400
+                       hover:bg-primary-50 dark:hover:bg-primary-950 transition-colors"
+            title="添加知识库"
+          >
+            <Plus size={16} />
+          </button>
+          <button
+            onClick={toggleLeftSidebar}
+            className="p-1 rounded-md text-surface-400 dark:text-surface-500
+                       hover:text-surface-700 dark:hover:text-surface-200
+                       hover:bg-surface-100 dark:hover:bg-surface-800 transition-colors"
+            title="折叠导航"
+          >
+            <PanelLeftClose size={16} />
+          </button>
+        </div>
       </div>
 
-      {/* File Tree */}
-      <div className="flex-1 overflow-y-auto py-2">
-        {fileTree.map((node) => (
-          <FileTreeNode key={node.id} node={node} />
-        ))}
+      <div className="flex-1 overflow-y-auto">
+        <div className="py-1 border-b border-surface-100 dark:border-surface-800">
+          {(knowledgeBases.length > 0 ? knowledgeBases : [
+            { id: 'default', name: '默认知识库', status: 'ready', document_count: 0 },
+          ]).map((kb) => (
+            <div key={kb.id}>
+              <KnowledgeBaseTreeItem
+                kb={kb}
+                isActive={activeKnowledgeBaseId === kb.id}
+                onClick={() => setActiveKnowledgeBase(kb.id)}
+                onDelete={handleDeleteKB}
+              />
+              {activeKnowledgeBaseId === kb.id && (
+                <div className="py-1 border-t border-surface-100 dark:border-surface-800">
+                  <KnowledgeBaseFileTree knowledgeBaseId={kb.id} />
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
       </div>
 
-      {/* Footer - Legend */}
       <div className="border-t border-surface-100 dark:border-surface-800 px-3 py-2 space-y-1">
         <div className="flex items-center gap-1.5 text-[10px] text-surface-400 dark:text-surface-500">
           <Flame size={10} className="text-red-500" />

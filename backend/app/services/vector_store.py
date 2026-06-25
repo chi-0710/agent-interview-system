@@ -93,17 +93,25 @@ def add_chunks(chunks: list) -> int:
     return len(ids)
 
 
-def similarity_search(query: str, top_k: int = 5) -> List[dict]:
+def similarity_search(query: str, top_k: int = 5, knowledge_base_id: Optional[str] = None) -> List[dict]:
     """
     相似度搜索。返回 [{id, text, metadata, distance}, ...]
     metadata 中的 headers 字段会被还原为 list。
+
+    Args:
+        knowledge_base_id: 可选，限定在指定知识库中检索
     """
     collection = get_collection()
 
-    results = collection.query(
+    kwargs = dict(
         query_texts=[query],
         n_results=top_k,
     )
+
+    if knowledge_base_id:
+        kwargs["where"] = {"knowledge_base_id": str(knowledge_base_id)}
+
+    results = collection.query(**kwargs)
 
     output = []
     if not results["ids"] or not results["ids"][0]:
@@ -121,6 +129,19 @@ def similarity_search(query: str, top_k: int = 5) -> List[dict]:
         })
 
     return output
+
+
+def delete_by_knowledge_base(knowledge_base_id: str) -> int:
+    """删除指定知识库的所有向量数据"""
+    collection = get_collection()
+    try:
+        results = collection.get(where={"knowledge_base_id": str(knowledge_base_id)})
+        if results["ids"]:
+            collection.delete(ids=results["ids"])
+            return len(results["ids"])
+    except Exception:
+        pass
+    return 0
 
 
 def delete_by_file(file_path: str) -> int:

@@ -12,6 +12,8 @@ import SmartReader from './components/Reader/SmartReader';
 import TestMode from './components/Test/TestMode';
 import RightDrawer from './components/Layout/RightDrawer';
 import AIBubble from './components/Copilot/AIBubble';
+import CreateKnowledgeBaseModal from './components/KnowledgeBase/CreateKnowledgeBaseModal';
+import ImportProgressModal from './components/KnowledgeBase/ImportProgressModal';
 import useTextSelection from './hooks/useTextSelection';
 
 /**
@@ -139,8 +141,9 @@ function MainContent() {
  */
 export default function App() {
   const theme = useAppStore((s) => s.theme);
+  const showCreateKBModal = useAppStore((s) => s.showCreateKBModal);
+  const showImportProgress = useAppStore((s) => s.showImportProgress);
 
-  // 初始加载时应用主题
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark');
   }, []);
@@ -154,9 +157,11 @@ export default function App() {
         <MainContent />
       </div>
 
-      {/* 全局浮动元素 */}
       <AIBubble />
       <RightDrawer />
+
+      {showCreateKBModal && <CreateKnowledgeBaseModal />}
+      {showImportProgress && <ImportProgressModal />}
     </div>
   );
 }

@@ -1,0 +1,369 @@
+"""知识库管理路由
+
+- POST   /api/knowledge-bases                        → 创建知识库
+- GET    /api/knowledge-bases                        → 列出所有知识库
+- GET    /api/knowledge-bases/{id}                   → 获取单个知识库
+- DELETE /api/knowledge-bases/{id}                   → 删除知识库
+- POST   /api/knowledge-bases/{id}/documents         → 上传文件并触发导入
+- GET    /api/knowledge-bases/{id}/jobs/{job_id}     → 查询导入进度
+- GET    /api/knowledge-bases/{id}/tree              → 获取知识库内文件树
+"""
+import os
+import uuid
+import logging
+from typing import List, Optional
+from datetime import datetime
+
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
+from pydantic import BaseModel
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_db
+from app.models import KnowledgeBase, ImportJob, Document
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/knowledge-bases", tags=["knowledge-bases"])
+
+
+class CreateKnowledgeBaseRequest(BaseModel):
+    name: str
+    description: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+
+class KnowledgeBaseResponse(BaseModel):
+    id: str
+    name: str
+    description: Optional[str] = None
+    tags: Optional[List[str]] = None
+    status: str
+    document_count: int
+    chunk_count: int
+    created_at: str
+    updated_at: str
+
+
+def _kb_to_response(kb: KnowledgeBase) -> dict:
+    return {
+        "id": str(kb.id),
+        "name": kb.name,
+        "description": kb.description,
+        "tags": kb.tags or [],
+        "status": kb.status,
+        "document_count": kb.document_count or 0,
+        "chunk_count": kb.chunk_count or 0,
+        "created_at": kb.created_at.isoformat() if kb.created_at else "",
+        "updated_at": kb.updated_at.isoformat() if kb.updated_at else "",
+    }
+
+
+@router.post("")
+async def create_knowledge_base(
+    req: CreateKnowledgeBaseRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """创建新知识库"""
+    kb = KnowledgeBase(
+        name=req.name,
+        description=req.description,
+        tags=req.tags or [],
+        status="draft",
+    )
+    db.add(kb)
+    await db.commit()
+    await db.refresh(kb)
+    return _kb_to_response(kb)
+
+
+@router.get("")
+async def list_knowledge_bases(
+    db: AsyncSession = Depends(get_db),
+):
+    """列出所有知识库"""
+    result = await db.execute(
+        select(KnowledgeBase).order_by(KnowledgeBase.created_at.desc())
+    )
+    kbs = result.scalars().all()
+
+    items = [_kb_to_response(kb) for kb in kbs]
+
+    default_kb = {
+        "id": "default",
+        "name": "默认知识库",
+        "description": "系统预置知识库",
+        "tags": [],
+        "status": "ready",
+        "document_count": 0,
+        "chunk_count": 0,
+        "created_at": "",
+        "updated_at": "",
+    }
+
+    try:
+        doc_count_result = await db.execute(
+            select(func.count(Document.id)).where(Document.knowledge_base_id == None)
+        )
+        default_doc_count = doc_count_result.scalar() or 0
+        default_kb["document_count"] = default_doc_count
+    except Exception:
+        pass
+
+    return [default_kb] + items
+
+
+@router.get("/{knowledge_base_id}")
+async def get_knowledge_base(
+    knowledge_base_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """获取单个知识库详情"""
+    if knowledge_base_id == "default":
+        return {
+            "id": "default",
+            "name": "默认知识库",
+            "description": "系统预置知识库",
+            "tags": [],
+            "status": "ready",
+            "document_count": 0,
+            "chunk_count": 0,
+            "created_at": "",
+            "updated_at": "",
+        }
+
+    result = await db.execute(
+        select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
+    )
+    kb = result.scalar_one_or_none()
+    if not kb:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    return _kb_to_response(kb)
+
+
+@router.delete("/{knowledge_base_id}")
+async def delete_knowledge_base(
+    knowledge_base_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """删除知识库及其所有关联数据"""
+    if knowledge_base_id == "default":
+        raise HTTPException(status_code=400, detail="不能删除默认知识库")
+
+    result = await db.execute(
+        select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
+    )
+    kb = result.scalar_one_or_none()
+    if not kb:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+
+    from app.services.vector_store import delete_by_knowledge_base
+    delete_by_knowledge_base(knowledge_base_id)
+
+    await db.delete(kb)
+    await db.commit()
+    return {"message": "知识库已删除", "id": knowledge_base_id}
+
+
+@router.post("/{knowledge_base_id}/documents")
+async def upload_documents(
+    knowledge_base_id: str,
+    files: List[UploadFile] = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """上传文件到知识库并触发导入流程"""
+    if knowledge_base_id == "default":
+        raise HTTPException(status_code=400, detail="默认知识库不支持直接上传")
+
+    result = await db.execute(
+        select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
+    )
+    kb = result.scalar_one_or_none()
+    if not kb:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+
+    job = ImportJob(
+        knowledge_base_id=knowledge_base_id,
+        status="processing",
+        total_files=len(files),
+        completed_files=0,
+        failed_files=0,
+        current_step="uploading",
+        progress_percent=0,
+        file_details=[],
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+
+    kb.status = "uploading"
+    await db.commit()
+
+    file_infos = []
+    job_file_details = []
+    allowed_extensions = {".md", ".txt", ".markdown"}
+
+    for f in files:
+        filename = f.filename or "unknown"
+        content_bytes = await f.read()
+        ext = os.path.splitext(filename)[1].lower()
+
+        if ext not in allowed_extensions:
+            job_file_details.append({
+                "filename": filename,
+                "status": "skipped",
+                "error": f"不支持的文件类型: {ext}",
+            })
+            continue
+
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                content = content_bytes.decode("gbk")
+            except Exception:
+                job_file_details.append({
+                    "filename": filename,
+                    "status": "failed",
+                    "error": "无法解码文件内容",
+                })
+                continue
+
+        file_type = "md" if ext in (".md", ".markdown") else "txt"
+        file_infos.append({
+            "filename": filename,
+            "content": content,
+            "file_type": file_type,
+        })
+        job_file_details.append({
+            "filename": filename,
+            "status": "queued",
+        })
+
+    if not file_infos:
+        job.status = "failed"
+        job.error_message = "没有可处理的文件"
+        job.file_details = job_file_details
+        kb.status = "failed"
+        await db.commit()
+        raise HTTPException(status_code=400, detail="没有可处理的文件")
+
+    job.file_details = job_file_details
+    job.current_step = "processing"
+    job.progress_percent = 10
+    await db.commit()
+
+    kb.status = "processing"
+    await db.commit()
+
+    try:
+        from app.services.ingestion import ingest_knowledge_base
+
+        job.current_step = "parsing"
+        job.progress_percent = 20
+        await db.commit()
+
+        ingestion_result = await ingest_knowledge_base(
+            knowledge_base_id=knowledge_base_id,
+            file_infos=file_infos,
+            db_session=db,
+        )
+
+        for i, fi in enumerate(ingestion_result.get("files", [])):
+            if i < len(job_file_details):
+                job_file_details[i]["status"] = "ready"
+                job_file_details[i]["chunks"] = fi.get("chunks", 0)
+
+        job.status = "completed"
+        job.completed_files = len(ingestion_result.get("files", []))
+        job.current_step = "done"
+        job.progress_percent = 100
+        job.file_details = job_file_details
+        kb.status = "ready"
+        await db.commit()
+
+        return {
+            "knowledge_base_id": knowledge_base_id,
+            "job_id": str(job.id),
+            "status": "completed",
+            "files": [
+                {
+                    "filename": fd["filename"],
+                    "status": fd["status"],
+                    "chunks": fd.get("chunks", 0),
+                }
+                for fd in job_file_details
+            ],
+        }
+
+    except Exception as e:
+        logger.exception(f"导入知识库失败: {e}")
+        job.status = "failed"
+        job.error_message = str(e)
+        kb.status = "failed"
+        await db.commit()
+        raise HTTPException(status_code=500, detail=f"导入失败: {str(e)}")
+
+
+@router.get("/{knowledge_base_id}/jobs/{job_id}")
+async def get_import_job(
+    knowledge_base_id: str,
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """查询导入任务进度"""
+    result = await db.execute(
+        select(ImportJob).where(
+            ImportJob.id == job_id,
+            ImportJob.knowledge_base_id == knowledge_base_id,
+        )
+    )
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="导入任务不存在")
+
+    return {
+        "job_id": str(job.id),
+        "status": job.status,
+        "progress": job.progress_percent or 0,
+        "current_step": job.current_step,
+        "total_files": job.total_files,
+        "completed_files": job.completed_files,
+        "failed_files": job.failed_files,
+        "error_message": job.error_message,
+        "documents": job.file_details or [],
+        "created_at": job.created_at.isoformat() if job.created_at else "",
+    }
+
+
+@router.get("/{knowledge_base_id}/tree")
+async def get_knowledge_base_tree(
+    knowledge_base_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """获取知识库内文件树"""
+    if knowledge_base_id == "default":
+        result = await db.execute(
+            select(Document).where(Document.knowledge_base_id == None)
+        )
+    else:
+        result = await db.execute(
+            select(Document).where(Document.knowledge_base_id == knowledge_base_id)
+        )
+
+    docs = result.scalars().all()
+
+    file_nodes = []
+    for doc in docs:
+        file_nodes.append({
+            "id": str(doc.id),
+            "title": doc.title,
+            "path": doc.file_path or "",
+            "type": "file",
+            "status": "none",
+            "file_type": doc.file_type,
+        })
+
+    return {
+        "knowledge_base_id": knowledge_base_id,
+        "files": file_nodes,
+    }

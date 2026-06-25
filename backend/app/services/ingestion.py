@@ -7,6 +7,8 @@
 3. 写入 PostgreSQL（documents + document_chunks 表）
 4. 建立 chunk 与 knowledge_point 的关联
 5. 向量化并写入 ChromaDB
+
+v2: 支持按知识库隔离，支持任意文本内容导入
 """
 import os
 import glob
@@ -14,7 +16,7 @@ import uuid
 from typing import List, Optional
 
 from app.services.chunker import chunk_markdown, Chunk
-from app.services.vector_store import add_chunks, delete_by_file
+from app.services.vector_store import add_chunks, delete_by_file, delete_by_knowledge_base
 
 
 def _scan_md_files(docs_dir: str) -> List[str]:
@@ -48,13 +50,20 @@ def _extract_title(content: str, file_path: str) -> str:
     return os.path.splitext(os.path.basename(file_path))[0]
 
 
+def _format_title_from_filename(filename: str) -> str:
+    """从文件名生成友好标题"""
+    name = os.path.splitext(filename)[0]
+    name = name.replace("_", " ").replace("-", " ")
+    return name
+
+
 def ingest_docs(
     docs_dir: str,
     db_session=None,
     clear_existing: bool = True,
 ) -> dict:
     """
-    主入库流程。
+    主入库流程（全局模式，向后兼容）。
 
     Args:
         docs_dir: Markdown 文档目录绝对路径
@@ -85,7 +94,6 @@ def ingest_docs(
         content = _read_file(abs_path)
         title = _extract_title(content, abs_path)
 
-        # 切片
         chunks = chunk_markdown(
             file_path=vpath,
             content=content,
@@ -106,29 +114,29 @@ def ingest_docs(
 
         result["total_chunks"] += len(chunks)
 
-    # 写入向量库
     if all_chunks:
         chunks_only = [c[0] for c in all_chunks]
         n_added = add_chunks(chunks_only)
         print(f"[ingestion] 向量库写入 {n_added} 条记录")
 
-    # 写入 PostgreSQL（如果提供了 session）
     if db_session is not None:
         _write_to_db_sync(all_chunks, db_session)
 
     return result
 
 
-async def _write_to_db(chunks_data: list, db_session):
+async def _write_to_db(chunks_data: list, db_session, knowledge_base_id: Optional[str] = None):
     """异步写入 PostgreSQL：Document + DocumentChunk + ChunkKnowledgeLink"""
     from app.models import Document, DocumentChunk, ChunkKnowledgeLink, KnowledgePoint
     from sqlalchemy import select
 
-    # 查询所有知识点，用于匹配
-    kp_result = await db_session.execute(select(KnowledgePoint))
+    kp_result = await db_session.execute(
+        select(KnowledgePoint).where(
+            KnowledgePoint.knowledge_base_id == knowledge_base_id
+        ) if knowledge_base_id else select(KnowledgePoint)
+    )
     all_kps = kp_result.scalars().all()
 
-    # 按文件分组
     files_map = {}  # vpath -> {"title": "", "content": "", "chunks": []}
     for c, vpath, title, content in chunks_data:
         if vpath not in files_map:
@@ -136,7 +144,6 @@ async def _write_to_db(chunks_data: list, db_session):
         files_map[vpath]["chunks"].append(c)
 
     for vpath, info in files_map.items():
-        # 检查 Document 是否已存在
         result = await db_session.execute(
             select(Document).where(Document.file_path == vpath)
         )
@@ -145,7 +152,8 @@ async def _write_to_db(chunks_data: list, db_session):
         if doc:
             doc.title = info["title"]
             doc.content = info["content"]
-            # 删除旧的 chunk
+            if knowledge_base_id:
+                doc.knowledge_base_id = knowledge_base_id
             from sqlalchemy import delete
             await db_session.execute(
                 delete(ChunkKnowledgeLink).where(
@@ -163,11 +171,11 @@ async def _write_to_db(chunks_data: list, db_session):
                 content=info["content"],
                 file_type="md",
                 file_path=vpath,
+                knowledge_base_id=knowledge_base_id,
             )
             db_session.add(doc)
             await db_session.flush()
 
-        # 写入 DocumentChunk
         chunk_records = []
         for idx, chunk in enumerate(info["chunks"]):
             headers = chunk.metadata.get("headers", [])
@@ -187,7 +195,6 @@ async def _write_to_db(chunks_data: list, db_session):
 
         await db_session.flush()
 
-        # 建立 ChunkKnowledgeLink（基于关键词匹配）
         for chunk_rec in chunk_records:
             text_lower = chunk_rec.content.lower()
             headers_lower = " ".join(chunk_rec.headers or []).lower()
@@ -195,19 +202,16 @@ async def _write_to_db(chunks_data: list, db_session):
 
             for kp in all_kps:
                 relevance = 0.0
-                # 用知识点名称匹配
                 kp_name = kp.name.lower()
                 if kp_name and len(kp_name) >= 2:
                     count = combined.count(kp_name)
                     if count > 0:
                         relevance += min(count * 0.3, 0.6)
-                # 用路径中的关键词匹配
                 if kp.path:
                     for part in kp.path.split("/"):
                         part = part.strip().lower()
                         if part and part != kp_name and len(part) >= 2 and part in combined:
                             relevance += 0.2
-                # 用描述匹配
                 if kp.description and kp.description.lower() in combined:
                     relevance += 0.1
 
@@ -229,7 +233,6 @@ def _write_to_db_sync(chunks_data: list, db_session):
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            # 在已运行的事件循环中
             import concurrent.futures
             future = asyncio.run_coroutine_threadsafe(
                 _write_to_db(chunks_data, db_session), loop
@@ -246,7 +249,7 @@ async def ingest_docs_async(
     db_session=None,
     clear_existing: bool = True,
 ) -> dict:
-    """异步版入库流程"""
+    """异步版入库流程（全局模式）"""
     if clear_existing:
         from app.services.vector_store import clear_collection
         clear_collection()
@@ -288,14 +291,106 @@ async def ingest_docs_async(
 
         result["total_chunks"] += len(chunks)
 
-    # 写入向量库
     if all_chunks_data:
         chunks_only = [c[0] for c in all_chunks_data]
         n_added = add_chunks(chunks_only)
         print(f"[ingestion] 向量库写入 {n_added} 条记录")
 
-    # 写入 PostgreSQL
     if db_session is not None:
         await _write_to_db(all_chunks_data, db_session)
+
+    return result
+
+
+async def ingest_knowledge_base(
+    knowledge_base_id: str,
+    file_infos: list,
+    db_session,
+) -> dict:
+    """
+    按知识库隔离的入库流程。
+
+    Args:
+        knowledge_base_id: 知识库 UUID
+        file_infos: [{filename, content, file_type}, ...]
+        db_session: 数据库会话
+
+    Returns:
+        {"total_files": int, "total_chunks": int, "files": [...]}
+    """
+    from app.models import KnowledgeBase, Document
+    from sqlalchemy import select
+
+    result = {
+        "total_files": len(file_infos),
+        "total_chunks": 0,
+        "files": [],
+    }
+
+    all_chunks_data = []
+    documents_created = []
+
+    for fi in file_infos:
+        filename = fi["filename"]
+        content = fi["content"]
+        file_type = fi.get("file_type", "md")
+        vpath = f"/kb/{knowledge_base_id}/{filename}"
+
+        title = _extract_title(content, filename)
+        if title == os.path.splitext(filename)[0]:
+            title = _format_title_from_filename(filename)
+
+        if file_type in ("md", "txt"):
+            chunks = chunk_markdown(
+                file_path=vpath,
+                content=content,
+                chunk_size=800,
+                chunk_overlap=150,
+            )
+        else:
+            chunks = chunk_markdown(
+                file_path=vpath,
+                content=content,
+                chunk_size=800,
+                chunk_overlap=150,
+            )
+
+        result["files"].append({
+            "filename": filename,
+            "title": title,
+            "chunks": len(chunks),
+            "status": "processed",
+        })
+
+        for c in chunks:
+            c.metadata["knowledge_base_id"] = str(knowledge_base_id)
+            c.metadata["document_filename"] = filename
+            all_chunks_data.append((c, vpath, title, content))
+
+        result["total_chunks"] += len(chunks)
+        documents_created.append({
+            "title": title,
+            "content": content,
+            "file_type": file_type,
+            "file_path": vpath,
+            "filename": filename,
+        })
+
+    if all_chunks_data:
+        chunks_only = [c[0] for c in all_chunks_data]
+        n_added = add_chunks(chunks_only)
+        print(f"[ingestion] 知识库 {knowledge_base_id} 向量库写入 {n_added} 条记录")
+
+    await _write_to_db(all_chunks_data, db_session, knowledge_base_id=knowledge_base_id)
+
+    kb_result = await db_session.execute(
+        select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
+    )
+    kb = kb_result.scalar_one_or_none()
+    if kb:
+        kb.document_count = len(file_infos)
+        kb.chunk_count = result["total_chunks"]
+        kb.status = "ready"
+        await db_session.commit()
 
     return result
