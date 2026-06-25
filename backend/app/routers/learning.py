@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from app.database import async_session_factory
 from app.services.learning import get_learning_service
+from app.services.mastery import get_mastery_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/learning", tags=["learning"])
@@ -120,3 +121,85 @@ async def list_plans():
 async def create_plan():
     """创建学习计划（stub）"""
     return {"message": "学习计划创建功能开发中，先使用 next-session 体验自适应出题"}
+
+
+# ---- 学习状态面板 ----
+
+@router.get("/mastery")
+async def get_mastery_list(
+    category: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+):
+    """获取用户所有知识点的掌握情况"""
+    try:
+        mastery_service = get_mastery_service()
+        async with async_session_factory() as session:
+            data = await mastery_service.get_user_mastery_list(
+                db=session,
+                user_id=USER_ID,
+                category=category,
+                status=status,
+            )
+            return data
+    except Exception as e:
+        logger.error(f"[learning/mastery] error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/review-tasks")
+async def get_review_tasks(
+    status: Optional[str] = Query(None),
+    limit: int = Query(20),
+):
+    """获取用户的复习任务列表"""
+    try:
+        mastery_service = get_mastery_service()
+        async with async_session_factory() as session:
+            data = await mastery_service.get_review_tasks(
+                db=session,
+                user_id=USER_ID,
+                status=status,
+                limit=limit,
+            )
+            return data
+    except Exception as e:
+        logger.error(f"[learning/review-tasks] error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/weak-points")
+async def get_weak_points(limit: int = Query(10)):
+    """获取用户最薄弱的知识点列表"""
+    try:
+        mastery_service = get_mastery_service()
+        async with async_session_factory() as session:
+            data = await mastery_service.get_weak_points(
+                db=session,
+                user_id=USER_ID,
+                limit=limit,
+            )
+            return data
+    except Exception as e:
+        logger.error(f"[learning/weak-points] error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/review-tasks/{task_id}/complete")
+async def complete_review_task(task_id: str):
+    """标记复习任务为已完成"""
+    try:
+        mastery_service = get_mastery_service()
+        async with async_session_factory() as session:
+            result = await mastery_service.complete_review_task(
+                db=session,
+                user_id=USER_ID,
+                task_id=task_id,
+            )
+            if result is None:
+                raise HTTPException(status_code=404, detail=f"Review task {task_id} not found")
+            return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[learning/review-tasks/complete] error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
