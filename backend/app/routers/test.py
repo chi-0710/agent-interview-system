@@ -325,7 +325,6 @@ async def submit_test(req: SubmitRequest) -> dict:
     scores = []
     enriched_evals = []
     diagnoses = []
-    all_mastery_delta = {}
 
     for i, (ans, q) in enumerate(answer_map):
         raw = eval_results[i] if i < len(eval_results) else None
@@ -376,12 +375,6 @@ async def submit_test(req: SubmitRequest) -> dict:
             "questionId": ans.question_id,
             **diag_result,
         })
-
-        # 汇总掌握度变化
-        for kp_id, delta in diag_result.get("mastery_delta", {}).items():
-            if kp_id not in all_mastery_delta:
-                all_mastery_delta[kp_id] = 0.0
-            all_mastery_delta[kp_id] += delta
 
     # ========== Step 5: 聚合 errorTags（向后兼容） ==========
     error_tags = aggregate_error_tags(enriched_evals, req.file_path)

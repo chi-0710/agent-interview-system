@@ -40,7 +40,7 @@ class DocumentChunk(Base):
     section_path = Column(String(1000), nullable=True)  # 完整 section 路径字符串
     start_line = Column(Integer, nullable=True)
     end_line = Column(Integer, nullable=True)
-    metadata = Column(JSON, nullable=True)
+    extra_metadata = Column("metadata", JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     document = relationship("Document", back_populates="chunks")
@@ -84,7 +84,7 @@ class KnowledgeRelation(Base):
     target_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_points.id", ondelete="CASCADE"), nullable=False)
     relation_type = Column(String(30), nullable=False)  # prerequisite, contains, similar, confused_with
     strength = Column(Float, default=1.0)  # 关系强度 0-1
-    metadata = Column(JSON, nullable=True)
+    extra_metadata = Column("metadata", JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (
@@ -273,7 +273,7 @@ class Diagnosis(Base):
     evidence_chunk_ids = Column(JSON, nullable=True)  # 资料证据 chunk ID 列表
     mastery_delta = Column(JSON, nullable=True)  # 掌握度变化 {kp_id: delta}
     review_suggestions = Column(JSON, nullable=True)  # 复习建议 [{action, kp_id, description}]
-    metadata = Column(JSON, nullable=True)
+    extra_metadata = Column("metadata", JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     answer = relationship("TestAnswer", back_populates="diagnoses")
@@ -307,7 +307,7 @@ class UserMastery(Base):
     confidence = Column(Float, default=0.0)  # 系统对掌握状态的置信度 0-1
     review_due_at = Column(DateTime, nullable=True)  # 下次复习时间
     streak = Column(Integer, default=0)  # 连续正确次数
-    metadata = Column(JSON, nullable=True)
+    extra_metadata = Column("metadata", JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -342,7 +342,7 @@ class MasteryEvent(Base):
     error_category = Column(String(50), nullable=True)  # concept_missing, concept_confusion, ...
     error_pattern_id = Column(String(100), nullable=True)  # 匹配到的错误模式 ID
 
-    metadata = Column(JSON, nullable=True)
+    extra_metadata = Column("metadata", JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     mastery = relationship("UserMastery", back_populates="mastery_events")

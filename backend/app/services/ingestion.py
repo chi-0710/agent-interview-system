@@ -180,7 +180,7 @@ async def _write_to_db(chunks_data: list, db_session):
                 section_path=section_path,
                 start_line=chunk.metadata.get("line_start"),
                 end_line=chunk.metadata.get("line_end"),
-                metadata=chunk.metadata,
+                extra_metadata=chunk.metadata,
             )
             db_session.add(chunk_rec)
             chunk_records.append(chunk_rec)
