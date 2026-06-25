@@ -14,21 +14,7 @@ export const mockFileTree = [
         title: '操作系统 - 内存管理',
         path: '/docs/cs/os-memory.md',
         type: 'file',
-        status: 'hot', // 🔥 高频错题
-      },
-      {
-        id: 'os-process',
-        title: '操作系统 - 进程与线程',
-        path: '/docs/cs/os-process.md',
-        type: 'file',
-        status: 'passed', // ✅ 已通过
-      },
-      {
-        id: 'ds-hashmap',
-        title: '数据结构 - HashMap 原理',
-        path: '/docs/cs/ds-hashmap.md',
-        type: 'file',
-        status: 'none',
+        status: 'hot',
       },
     ],
   },
@@ -41,34 +27,6 @@ export const mockFileTree = [
         id: 'react-fiber',
         title: 'React - Fiber 架构',
         path: '/docs/frontend/react-fiber.md',
-        type: 'file',
-        status: 'hot',
-      },
-      {
-        id: 'js-eventloop',
-        title: 'JavaScript - 事件循环',
-        path: '/docs/frontend/js-eventloop.md',
-        type: 'file',
-        status: 'none',
-      },
-      {
-        id: 'css-layout',
-        title: 'CSS - 布局与 BFC',
-        path: '/docs/frontend/css-layout.md',
-        type: 'file',
-        status: 'passed',
-      },
-    ],
-  },
-  {
-    id: 'ml',
-    title: '机器学习',
-    type: 'folder',
-    children: [
-      {
-        id: 'ml-attention',
-        title: 'Attention 机制详解',
-        path: '/docs/ml/attention.md',
         type: 'file',
         status: 'hot',
       },
