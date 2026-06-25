@@ -28,6 +28,7 @@ from app.models import (
     QuestionKnowledgeLink,
     PracticeSession,
     PracticeSessionQuestion,
+    MasteryEvent,
 )
 
 
@@ -130,9 +131,8 @@ class LearningService:
             "questions": [
                 {
                     "id": str(q.id),
-                    "type": q.question_type,
+                    "type": q.type,
                     "difficulty": q.difficulty,
-                    "title": q.title,
                     "content": q.content,
                     "options": q.options,
                     "selected_reason": reason,
@@ -195,6 +195,24 @@ class LearningService:
                 prereq_map[target_id] = []
             prereq_map[target_id].append(str(pr.source_id))
 
+        # 查询最近错误时间（从 MasteryEvent 获取，避免在 UserMastery 上维护 last_wrong_at）
+        last_wrong_result = await db.execute(
+            select(MasteryEvent.knowledge_point_id, MasteryEvent.created_at)
+            .where(
+                MasteryEvent.user_id == user_id,
+                MasteryEvent.event_type == "answer_wrong",
+                MasteryEvent.knowledge_point_id.in_(all_kp_ids),
+            )
+            .order_by(MasteryEvent.created_at.desc())
+        )
+        last_wrong_rows = last_wrong_result.all()
+        # 取每个知识点的最近错误时间（只保留最新的）
+        last_wrong_map: Dict[str, datetime] = {}
+        for kp_id_from_event, created_at in last_wrong_rows:
+            kp_id_str = str(kp_id_from_event)
+            if kp_id_str not in last_wrong_map:
+                last_wrong_map[kp_id_str] = created_at
+
         now = datetime.utcnow()
         priorities = []
 
@@ -235,9 +253,10 @@ class LearningService:
                 score += (importance / 10.0) * 1.5
                 info["importance"] = importance
 
-                # 最近错误权重
-                if mastery and mastery.last_wrong_at:
-                    days_since_wrong = (now - mastery.last_wrong_at).days
+                # 最近错误权重（从 MasteryEvent 查询，而非直接访问不存在的 last_wrong_at）
+                last_wrong_at = last_wrong_map.get(kp_id)
+                if last_wrong_at:
+                    days_since_wrong = (now - last_wrong_at).days
                     if days_since_wrong <= 7:
                         score += 1.2 * (1.0 - days_since_wrong / 7.0)
                         info["recently_wrong"] = True
