@@ -14,12 +14,12 @@ import logging
 from typing import List, Optional
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
+from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Depends
 from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import get_db
+from app.database import get_db, async_session_factory
 from app.models import KnowledgeBase, ImportJob, Document
 
 logger = logging.getLogger(__name__)
@@ -164,13 +164,89 @@ async def delete_knowledge_base(
     return {"message": "知识库已删除", "id": knowledge_base_id}
 
 
+async def _process_import_job(
+    job_id: str,
+    knowledge_base_id: str,
+    file_infos: list,
+    job_file_details: list,
+):
+    """后台任务：执行实际的文档解析、切片、向量入库"""
+    from app.services.ingestion import ingest_knowledge_base
+
+    async with async_session_factory() as session:
+        try:
+            result_job = await session.execute(
+                select(ImportJob).where(ImportJob.id == job_id)
+            )
+            job = result_job.scalar_one_or_none()
+            if not job:
+                return
+
+            result_kb = await session.execute(
+                select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
+            )
+            kb = result_kb.scalar_one_or_none()
+
+            job.current_step = "parsing"
+            job.progress_percent = 20
+            await session.commit()
+
+            ingestion_result = await ingest_knowledge_base(
+                knowledge_base_id=knowledge_base_id,
+                file_infos=file_infos,
+                db_session=session,
+            )
+
+            result_map = {}
+            for fi in ingestion_result.get("files", []):
+                result_map[fi["filename"]] = fi
+
+            for fd in job_file_details:
+                fname = fd["filename"]
+                if fname in result_map:
+                    fd["status"] = "ready"
+                    fd["chunks"] = result_map[fname].get("chunks", 0)
+
+            job.status = "completed"
+            job.completed_files = len(ingestion_result.get("files", []))
+            job.current_step = "done"
+            job.progress_percent = 100
+            job.file_details = job_file_details
+            if kb:
+                kb.status = "ready"
+            await session.commit()
+
+        except Exception as e:
+            logger.exception(f"后台导入任务失败: {e}")
+            try:
+                async with async_session_factory() as err_session:
+                    result_job = await err_session.execute(
+                        select(ImportJob).where(ImportJob.id == job_id)
+                    )
+                    job = result_job.scalar_one_or_none()
+                    result_kb = await err_session.execute(
+                        select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
+                    )
+                    kb = result_kb.scalar_one_or_none()
+                    if job:
+                        job.status = "failed"
+                        job.error_message = str(e)
+                        job.file_details = job_file_details
+                    if kb:
+                        kb.status = "failed"
+                    await err_session.commit()
+            except Exception:
+                pass
+
+
 @router.post("/{knowledge_base_id}/documents")
 async def upload_documents(
     knowledge_base_id: str,
+    background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
 ):
-    """上传文件到知识库并触发导入流程"""
+    """上传文件到知识库，立即返回 job_id，后台异步处理导入"""
     if knowledge_base_id == "default":
         raise HTTPException(status_code=400, detail="默认知识库不支持直接上传")
 
@@ -209,6 +285,7 @@ async def upload_documents(
 
         if ext not in allowed_extensions:
             job_file_details.append({
+                "upload_id": str(uuid.uuid4()),
                 "filename": filename,
                 "status": "skipped",
                 "error": f"不支持的文件类型: {ext}",
@@ -222,6 +299,7 @@ async def upload_documents(
                 content = content_bytes.decode("gbk")
             except Exception:
                 job_file_details.append({
+                    "upload_id": str(uuid.uuid4()),
                     "filename": filename,
                     "status": "failed",
                     "error": "无法解码文件内容",
@@ -229,12 +307,15 @@ async def upload_documents(
                 continue
 
         file_type = "md" if ext in (".md", ".markdown") else "txt"
+        upload_id = str(uuid.uuid4())
         file_infos.append({
+            "upload_id": upload_id,
             "filename": filename,
             "content": content,
             "file_type": file_type,
         })
         job_file_details.append({
+            "upload_id": upload_id,
             "filename": filename,
             "status": "queued",
         })
@@ -255,53 +336,26 @@ async def upload_documents(
     kb.status = "processing"
     await db.commit()
 
-    try:
-        from app.services.ingestion import ingest_knowledge_base
+    background_tasks.add_task(
+        _process_import_job,
+        str(job.id),
+        knowledge_base_id,
+        file_infos,
+        job_file_details,
+    )
 
-        job.current_step = "parsing"
-        job.progress_percent = 20
-        await db.commit()
-
-        ingestion_result = await ingest_knowledge_base(
-            knowledge_base_id=knowledge_base_id,
-            file_infos=file_infos,
-            db_session=db,
-        )
-
-        for i, fi in enumerate(ingestion_result.get("files", [])):
-            if i < len(job_file_details):
-                job_file_details[i]["status"] = "ready"
-                job_file_details[i]["chunks"] = fi.get("chunks", 0)
-
-        job.status = "completed"
-        job.completed_files = len(ingestion_result.get("files", []))
-        job.current_step = "done"
-        job.progress_percent = 100
-        job.file_details = job_file_details
-        kb.status = "ready"
-        await db.commit()
-
-        return {
-            "knowledge_base_id": knowledge_base_id,
-            "job_id": str(job.id),
-            "status": "completed",
-            "files": [
-                {
-                    "filename": fd["filename"],
-                    "status": fd["status"],
-                    "chunks": fd.get("chunks", 0),
-                }
-                for fd in job_file_details
-            ],
-        }
-
-    except Exception as e:
-        logger.exception(f"导入知识库失败: {e}")
-        job.status = "failed"
-        job.error_message = str(e)
-        kb.status = "failed"
-        await db.commit()
-        raise HTTPException(status_code=500, detail=f"导入失败: {str(e)}")
+    return {
+        "knowledge_base_id": knowledge_base_id,
+        "job_id": str(job.id),
+        "status": "processing",
+        "files": [
+            {
+                "filename": fd["filename"],
+                "status": fd["status"],
+            }
+            for fd in job_file_details
+        ],
+    }
 
 
 @router.get("/{knowledge_base_id}/jobs/{job_id}")

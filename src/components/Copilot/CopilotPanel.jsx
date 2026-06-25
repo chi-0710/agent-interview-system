@@ -84,6 +84,7 @@ export default function CopilotPanel() {
   const chatMessages = useAppStore((s) => s.chatMessages);
   const isStreaming = useAppStore((s) => s.isStreaming);
   const activeFile = useAppStore((s) => s.activeFile);
+  const activeKnowledgeBaseId = useAppStore((s) => s.activeKnowledgeBaseId);
   const addChatMessage = useAppStore((s) => s.addChatMessage);
   const setStreaming = useAppStore((s) => s.setStreaming);
   const clearChat = useAppStore((s) => s.clearChat);
@@ -110,6 +111,7 @@ export default function CopilotPanel() {
       {
         message: text,
         file_path: activeFile?.path || '',
+        knowledge_base_id: activeKnowledgeBaseId || null,
       },
       (chunk) => {
         accumulated += chunk;

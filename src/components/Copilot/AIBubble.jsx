@@ -11,6 +11,7 @@ export default function AIBubble() {
   const selection = useAppStore((s) => s.selection);
   const activeFile = useAppStore((s) => s.activeFile);
   const currentHeaders = useAppStore((s) => s.currentHeaders);
+  const activeKnowledgeBaseId = useAppStore((s) => s.activeKnowledgeBaseId);
   const openRightDrawer = useAppStore((s) => s.openRightDrawer);
   const addChatMessage = useAppStore((s) => s.addChatMessage);
   const setStreaming = useAppStore((s) => s.setStreaming);
@@ -47,8 +48,9 @@ export default function AIBubble() {
       {
         selected_text: selectedText,
         file_path: filePath,
+        knowledge_base_id: activeKnowledgeBaseId || null,
         headers: currentHeaders || [],
-        block_context: blockContext, // 新增：完整段落上下文
+        block_context: blockContext,
       },
       (chunk) => {
         accumulated += chunk;

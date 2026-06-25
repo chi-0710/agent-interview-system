@@ -17,22 +17,27 @@ logger = logging.getLogger(__name__)
 def _retrieve_context(
     selected_text: str,
     file_path: str,
+    knowledge_base_id: Optional[str] = None,
     top_k: int = 3,
 ) -> List[dict]:
     """
     检索相关上下文 chunks（fallback 策略）。
 
-    1. 语义搜索取 top_k
+    1. 语义搜索取 top_k（按 knowledge_base_id 隔离）
     2. 按 file_path 过滤
-    3. 如果过滤后不够 top_k，补齐（放宽 file_path 限制）
+    3. 如果过滤后不够 top_k，用同知识库的其他结果补齐
     """
     from app.services.vector_store import similarity_search
-    results = similarity_search(selected_text, top_k=top_k * 2)
+    results = similarity_search(
+        selected_text,
+        top_k=top_k * 2,
+        knowledge_base_id=knowledge_base_id,
+    )
 
     # 按 file_path 过滤
     same_file = [r for r in results if r["metadata"].get("file_path") == file_path]
 
-    # 如果同文件结果不足，用原始结果补齐
+    # 如果同文件结果不足，用同知识库的其他结果补齐
     if len(same_file) < top_k:
         other = [r for r in results if r not in same_file]
         same_file += other[: top_k - len(same_file)]
@@ -43,6 +48,7 @@ def _retrieve_context(
 
     logger.info(
         f"[copilot] retrieve: query='{selected_text[:50]}...', "
+        f"kb_id={knowledge_base_id}, "
         f"same_file={len([r for r in results if r['metadata'].get('file_path') == file_path])}, "
         f"chosen={len(chosen)}, "
         f"headers={[r['metadata'].get('headers','') for r in chosen]}"
@@ -99,6 +105,7 @@ async def explain_stream(
     file_path: str,
     headers: List[str] = None,
     block_context: Optional[str] = None,
+    knowledge_base_id: Optional[str] = None,
     top_k: int = 3,
 ) -> AsyncIterator[str]:
     """
@@ -109,6 +116,7 @@ async def explain_stream(
         file_path: 当前文档路径
         headers: 当前阅读位置的标题层级
         block_context: 前端提取的完整段落上下文（优先使用）
+        knowledge_base_id: 知识库 ID，用于检索隔离
         top_k: 向量检索的 chunk 数量（fallback 时使用）
 
     Yields:
@@ -125,8 +133,12 @@ async def explain_stream(
         context_text = block_context.strip()
         logger.info(f"[copilot] using block_context: {len(context_text)} chars")
     else:
-        # fallback：向量检索
-        chunks = _retrieve_context(selected_text, file_path, top_k=top_k)
+        # fallback：向量检索（限定在当前知识库内）
+        chunks = _retrieve_context(
+            selected_text, file_path,
+            knowledge_base_id=knowledge_base_id,
+            top_k=top_k,
+        )
         if chunks:
             parts = []
             for i, chunk in enumerate(chunks):
@@ -152,6 +164,7 @@ async def chat_stream(
     file_path: str = None,
     top_k: int = 3,
     session_id: Optional[str] = None,
+    knowledge_base_id: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """
     自由对话（用户在 CopilotPanel 输入框中的提问）。
@@ -165,15 +178,20 @@ async def chat_stream(
         file_path: 当前文档路径（用于检索上下文）
         top_k: 检索的 chunk 数量
         session_id: 会话 ID（用于记忆管理）
+        knowledge_base_id: 知识库 ID，用于检索隔离
     """
     if not user_message or not user_message.strip():
         yield "请输入有效的问题。"
         return
 
-    # 检索相关上下文
+    # 检索相关上下文（限定在当前知识库内）
     chunks = []
     if file_path:
-        chunks = _retrieve_context(user_message, file_path, top_k=top_k)
+        chunks = _retrieve_context(
+            user_message, file_path,
+            knowledge_base_id=knowledge_base_id,
+            top_k=top_k,
+        )
 
     # 拼上下文
     context_text = ""

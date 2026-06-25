@@ -24,6 +24,7 @@ router = APIRouter(prefix="/api/copilot", tags=["copilot"])
 class ExplainRequest(BaseModel):
     selected_text: str
     file_path: str
+    knowledge_base_id: Optional[str] = None
     headers: list[str] = []
     block_context: Optional[str] = None  # 新增：前端提取的完整段落上下文
 
@@ -45,6 +46,7 @@ class ExplainRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     file_path: Optional[str] = None
+    knowledge_base_id: Optional[str] = None
     session_id: Optional[str] = None  # 新增：会话 ID，用于记忆管理
 
     @field_validator("message")
@@ -141,7 +143,8 @@ async def explain(request: ExplainRequest):
                 selected_text=request.selected_text,
                 file_path=request.file_path,
                 headers=request.headers,
-                block_context=request.block_context,  # 新增：前端提取的段落上下文
+                block_context=request.block_context,
+                knowledge_base_id=request.knowledge_base_id,
             ):
                 yield await _sse_event("chunk", token)
             yield await _sse_event("done")
@@ -189,6 +192,7 @@ async def copilot_chat(request: ChatRequest):
                 user_message=request.message,
                 file_path=request.file_path,
                 session_id=request.session_id,
+                knowledge_base_id=request.knowledge_base_id,
             ):
                 yield await _sse_event("chunk", token)
             yield await _sse_event("done")
