@@ -20,6 +20,16 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def kp_id_to_uuid(kp_id: str) -> uuid.UUID:
+    """将字符串知识点 ID 转换为稳定的 UUID（基于命名空间）"""
+    return uuid.uuid5(uuid.NAMESPACE_DNS, f"agent-interview-system.kp.{kp_id}")
+
+
+def rel_id_to_uuid(rel_source: str, rel_target: str, rel_type: str) -> uuid.UUID:
+    """将关系信息转换为稳定的 UUID"""
+    return uuid.uuid5(uuid.NAMESPACE_DNS, f"agent-interview-system.rel.{rel_source}.{rel_target}.{rel_type}")
+
+
 # ============== 知识点树 ==============
 # 操作系统 → 内存管理 → 页面置换 / TLB / 虚拟内存
 # 前端 → React → Fiber架构 → 双缓冲 / 调度 / 时间切片
@@ -172,6 +182,15 @@ SEED_KNOWLEDGE_RELATIONS = [
 ]
 
 # ============== 题目 + 知识点关联 + 常见错误 ==============
+# common_mistakes 新格式：
+# {
+#     "id": "错误模式唯一ID",
+#     "error_type": "concept_confusion | concept_missing | ...",
+#     "cue_terms": ["用户答案中出现的错误关键词"],
+#     "missing_terms": ["用户答案中缺失的正确关键词"],
+#     "target_kp_ids": ["kp-os-tlb", ...],
+#     "diagnostic_template": "诊断模板，可包含 {kp} 占位符"
+# }
 SEED_QUESTIONS = [
     # ---- os-memory.md ----
     {
@@ -193,8 +212,22 @@ SEED_QUESTIONS = [
                     {"kp_id": "kp-os-virtual-memory", "role": "secondary", "weight": 0.3},
                 ],
                 "common_mistakes": [
-                    {"error_type": "concept_confusion", "description": "混淆 FIFO 和 LRU 的特性", "kp_ids": ["kp-os-page-replacement", "kp-os-belady"]},
-                    {"error_type": "concept_missing", "description": "不知道 Belady 异常是什么", "kp_ids": ["kp-os-belady"]},
+                    {
+                        "id": "belady-concept-confusion-fifo-lru",
+                        "error_type": "concept_confusion",
+                        "cue_terms": ["fifo", "先进先出"],
+                        "missing_terms": ["lru", "最近最少使用", "栈算法"],
+                        "target_kp_ids": ["kp-os-page-replacement", "kp-os-belady"],
+                        "diagnostic_template": "混淆了 FIFO 和 LRU 的特性，FIFO 会出现 Belady 异常而 LRU 不会",
+                    },
+                    {
+                        "id": "belady-missing-concept",
+                        "error_type": "concept_missing",
+                        "cue_terms": ["不会", "不知道"],
+                        "missing_terms": ["belady", "异常", "增加页框", "缺页率"],
+                        "target_kp_ids": ["kp-os-belady"],
+                        "diagnostic_template": "不理解 Belady 异常的概念：增加物理页框数反而导致缺页率上升",
+                    },
                 ],
             },
             {
@@ -213,9 +246,30 @@ SEED_QUESTIONS = [
                     {"kp_id": "kp-os-virtual-memory", "role": "secondary", "weight": 0.5},
                 ],
                 "common_mistakes": [
-                    {"error_type": "concept_confusion", "description": "把 TLB 当成 CPU Cache，混淆了缓存对象", "kp_ids": ["kp-os-tlb", "kp-os-cpu-cache"]},
-                    {"error_type": "concept_missing", "description": "不知道 TLB 的作用和地址翻译过程", "kp_ids": ["kp-os-tlb"]},
-                    {"error_type": "expression_problem", "description": "知道区别但描述不完整", "kp_ids": ["kp-os-tlb"]},
+                    {
+                        "id": "tlb-cache-confusion",
+                        "error_type": "concept_confusion",
+                        "cue_terms": ["缓存", "数据", "内容", "指令"],
+                        "missing_terms": ["地址翻译", "vpn", "pfn", "mmu", "映射"],
+                        "target_kp_ids": ["kp-os-tlb", "kp-os-cpu-cache"],
+                        "diagnostic_template": "混淆了 TLB 和 CPU Cache 的作用：TLB 缓存的是地址映射关系，而非数据内容",
+                    },
+                    {
+                        "id": "tlb-missing-concept",
+                        "error_type": "concept_missing",
+                        "cue_terms": ["加速", "缓存"],
+                        "missing_terms": ["虚拟地址", "物理地址", "页表", "地址翻译"],
+                        "target_kp_ids": ["kp-os-tlb"],
+                        "diagnostic_template": "知道 TLB 是缓存，但不清楚它缓存的是虚拟地址到物理地址的映射关系",
+                    },
+                    {
+                        "id": "tlb-incomplete-expression",
+                        "error_type": "expression_problem",
+                        "cue_terms": [],
+                        "missing_terms": ["层次结构", "互补", "mmu"],
+                        "target_kp_ids": ["kp-os-tlb"],
+                        "diagnostic_template": "理解了 TLB 的基本作用，但未清晰描述与 CPU Cache 的层次互补关系",
+                    },
                 ],
             },
             {
@@ -233,8 +287,22 @@ SEED_QUESTIONS = [
                     {"kp_id": "kp-os-page-replacement", "role": "secondary", "weight": 0.6},
                 ],
                 "common_mistakes": [
-                    {"error_type": "coding_error", "description": "算法逻辑错误，指针移动方向或访问位处理错误", "kp_ids": ["kp-os-clock"]},
-                    {"error_type": "application_error", "description": "理解原理但不会写代码", "kp_ids": ["kp-os-clock"]},
+                    {
+                        "id": "clock-logic-error",
+                        "error_type": "coding_error",
+                        "cue_terms": ["替换", "换出", "移除"],
+                        "missing_terms": ["访问位", "ref_bit", "清零", "第二次机会"],
+                        "target_kp_ids": ["kp-os-clock"],
+                        "diagnostic_template": "Clock 算法核心逻辑错误：遇到 ref_bit=1 的页面时应清除访问位并继续扫描，而非直接替换",
+                    },
+                    {
+                        "id": "clock-application-error",
+                        "error_type": "application_error",
+                        "cue_terms": ["原理", "概念"],
+                        "missing_terms": ["循环扫描", "近似lru", "指针"],
+                        "target_kp_ids": ["kp-os-clock"],
+                        "diagnostic_template": "理解 Clock 算法的大致原理，但无法正确实现核心逻辑",
+                    },
                 ],
             },
         ],
@@ -258,7 +326,14 @@ SEED_QUESTIONS = [
                     {"kp_id": "kp-fiber-arch", "role": "secondary", "weight": 0.5},
                 ],
                 "common_mistakes": [
-                    {"error_type": "concept_confusion", "description": "混淆 return/sibling/child/alternate 的作用", "kp_ids": ["kp-fiber-double-buffer"]},
+                    {
+                        "id": "fiber-alternate-confusion",
+                        "error_type": "concept_confusion",
+                        "cue_terms": ["return", "sibling", "child", "父节点", "子节点"],
+                        "missing_terms": ["alternate", "双缓冲", "current", "work"],
+                        "target_kp_ids": ["kp-fiber-double-buffer"],
+                        "diagnostic_template": "混淆了 Fiber 节点的 alternate 字段与其他遍历字段（return/sibling/child）",
+                    },
                 ],
             },
             {
@@ -277,9 +352,30 @@ SEED_QUESTIONS = [
                     {"kp_id": "kp-fiber-arch", "role": "secondary", "weight": 0.5},
                 ],
                 "common_mistakes": [
-                    {"error_type": "concept_missing", "description": "不理解 Stack Reconciler 的问题", "kp_ids": ["kp-fiber-arch"]},
-                    {"error_type": "expression_problem", "description": "理解但表达不完整，遗漏时间切片或优先级调度", "kp_ids": ["kp-fiber-scheduling", "kp-fiber-time-slicing"]},
-                    {"error_type": "reasoning_gap", "description": "知道 Fiber 更好，但说不清为什么以及解决了什么问题", "kp_ids": ["kp-fiber-scheduling"]},
+                    {
+                        "id": "fiber-stack-reconciler-missing",
+                        "error_type": "concept_missing",
+                        "cue_terms": ["fiber", "新", "升级"],
+                        "missing_terms": ["stack", "递归", "同步", "阻塞", "无法中断"],
+                        "target_kp_ids": ["kp-fiber-arch"],
+                        "diagnostic_template": "不了解 Stack Reconciler 的核心问题：同步递归导致无法中断，长任务阻塞主线程",
+                    },
+                    {
+                        "id": "fiber-incomplete-expression",
+                        "error_type": "expression_problem",
+                        "cue_terms": ["可中断", "调度"],
+                        "missing_terms": ["时间切片", "优先级", "协作式", "空闲时间"],
+                        "target_kp_ids": ["kp-fiber-scheduling", "kp-fiber-time-slicing"],
+                        "diagnostic_template": "知道 Fiber 的可中断渲染，但遗漏了时间切片和优先级调度这两个关键机制",
+                    },
+                    {
+                        "id": "fiber-reasoning-gap",
+                        "error_type": "reasoning_gap",
+                        "cue_terms": ["更好", "改进"],
+                        "missing_terms": ["掉帧", "输入延迟", "帧率", "主线程"],
+                        "target_kp_ids": ["kp-fiber-scheduling"],
+                        "diagnostic_template": "知道 Fiber Reconciler 比 Stack Reconciler 更好，但说不清具体解决了什么问题（掉帧、输入延迟）",
+                    },
                 ],
             },
         ],
@@ -295,12 +391,14 @@ async def seed_knowledge_points(session):
     created = 0
     updated = 0
 
-    def _create_recursive(kp_data, parent_id=None):
+    async def _create_recursive(kp_data, parent_id=None):
         nonlocal created, updated
-        kp_id = kp_data["id"]
+        kp_id_str = kp_data["id"]
+        kp_uuid = kp_id_to_uuid(kp_id_str)
+        parent_uuid = kp_id_to_uuid(parent_id) if parent_id else None
 
-        result = session.execute(
-            select(KnowledgePoint).where(KnowledgePoint.id == kp_id)
+        result = await session.execute(
+            select(KnowledgePoint).where(KnowledgePoint.id == kp_uuid)
         )
         existing = result.scalar_one_or_none()
 
@@ -311,28 +409,28 @@ async def seed_knowledge_points(session):
             existing.category = kp_data.get("category")
             existing.importance = kp_data.get("importance", 5)
             existing.description = kp_data.get("description")
-            existing.parent_id = parent_id
+            existing.parent_id = parent_uuid
             updated += 1
         else:
             kp = KnowledgePoint(
-                id=kp_id,
+                id=kp_uuid,
                 name=kp_data["name"],
                 level=kp_data["level"],
                 path=kp_data["path"],
                 category=kp_data.get("category"),
                 importance=kp_data.get("importance", 5),
                 description=kp_data.get("description"),
-                parent_id=parent_id,
+                parent_id=parent_uuid,
             )
             session.add(kp)
             created += 1
 
         # 递归处理子节点
         for child in kp_data.get("children", []):
-            _create_recursive(child, parent_id=kp_id)
+            await _create_recursive(child, parent_id=kp_id_str)
 
     for root in SEED_KNOWLEDGE_POINTS:
-        _create_recursive(root)
+        await _create_recursive(root)
 
     await session.flush()
     return created, updated
@@ -345,18 +443,21 @@ async def seed_knowledge_relations(session):
 
     created = 0
     for rel in SEED_KNOWLEDGE_RELATIONS:
+        source_uuid = kp_id_to_uuid(rel["source"])
+        target_uuid = kp_id_to_uuid(rel["target"])
         result = await session.execute(
             select(KnowledgeRelation).where(
-                KnowledgeRelation.source_id == rel["source"],
-                KnowledgeRelation.target_id == rel["target"],
+                KnowledgeRelation.source_id == source_uuid,
+                KnowledgeRelation.target_id == target_uuid,
                 KnowledgeRelation.relation_type == rel["type"],
             )
         )
         existing = result.scalar_one_or_none()
         if not existing:
             kr = KnowledgeRelation(
-                source_id=rel["source"],
-                target_id=rel["target"],
+                id=rel_id_to_uuid(rel["source"], rel["target"], rel["type"]),
+                source_id=source_uuid,
+                target_id=target_uuid,
                 relation_type=rel["type"],
                 strength=rel.get("strength", 1.0),
             )
@@ -441,16 +542,17 @@ async def seed_questions_and_links(session):
 
             # 创建知识点关联
             for link in q_seed.get("knowledge_links", []):
+                kp_uuid = kp_id_to_uuid(link["kp_id"])
                 result = await session.execute(
                     select(QuestionKnowledgeLink).where(
                         QuestionKnowledgeLink.question_id == qid,
-                        QuestionKnowledgeLink.knowledge_point_id == link["kp_id"],
+                        QuestionKnowledgeLink.knowledge_point_id == kp_uuid,
                     )
                 )
                 if not result.scalar_one_or_none():
                     qkl = QuestionKnowledgeLink(
                         question_id=qid,
-                        knowledge_point_id=link["kp_id"],
+                        knowledge_point_id=kp_uuid,
                         role=link.get("role", "primary"),
                         weight=link.get("weight", 1.0),
                     )

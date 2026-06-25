@@ -431,7 +431,8 @@ async def submit_test(req: SubmitRequest) -> dict:
 
                 await session.flush()
 
-                # 6.3 保存诊断记录
+                # 6.3 保存诊断记录，并建立 question_id -> diagnosis_id 映射
+                diagnosis_ids = {}
                 for diag in diagnoses:
                     qid = diag["questionId"]
                     answer_record = answer_records.get(qid)
@@ -448,6 +449,8 @@ async def submit_test(req: SubmitRequest) -> dict:
                         review_suggestions=diag.get("review_suggestions"),
                     )
                     session.add(diag_record)
+                    await session.flush()
+                    diagnosis_ids[qid] = str(diag_record.id)
 
                 await session.flush()
 
@@ -486,16 +489,41 @@ async def submit_test(req: SubmitRequest) -> dict:
                         mastery_updates[kp_id] = update
 
                 # 6.5 生成复习任务
+                # 注意：先获取 evidence_chunks，再生成任务
+                all_weak_kp_ids = set()
+                for diag in diagnoses:
+                    for kp_id in diag.get("weak_kp_ids", []):
+                        all_weak_kp_ids.add(str(kp_id))
+
+                evidence_map = {}
+                if all_weak_kp_ids:
+                    evidence_map = await mastery_service.get_evidence_chunks_for_kps(
+                        db=session,
+                        kp_ids=list(all_weak_kp_ids),
+                        limit_per_kp=3,
+                    )
+
                 for diag in diagnoses:
                     if diag.get("error_category"):
                         question_id = diag.get("questionId")
                         diagnosis_id = diagnosis_ids.get(question_id)
+
+                        # 将 evidence_chunks 信息传入 diagnosis
+                        diag_evidence = {}
+                        for kp_id in diag.get("weak_kp_ids", []):
+                            chunks = evidence_map.get(str(kp_id), [])
+                            if chunks:
+                                diag_evidence[str(kp_id)] = chunks
+                        if diag_evidence:
+                            diag["evidence_chunks"] = diag_evidence
+
                         tasks = await mastery_service.create_review_tasks_from_diagnosis(
                             db=session,
                             user_id=USER_ID,
                             diagnosis=diag,
                             diagnosis_id=diagnosis_id,
                             question_id=question_id,
+                            evidence_map=evidence_map,
                         )
                         review_tasks.extend(tasks)
 
@@ -505,26 +533,6 @@ async def submit_test(req: SubmitRequest) -> dict:
                     user_id=USER_ID,
                     limit=5,
                 )
-
-                # 6.7 为诊断结果补充证据 chunks
-                all_weak_kp_ids = set()
-                for diag in diagnoses:
-                    for kp_id in diag.get("weak_kp_ids", []):
-                        all_weak_kp_ids.add(str(kp_id))
-                if all_weak_kp_ids:
-                    evidence_map = await mastery_service.get_evidence_chunks_for_kps(
-                        db=session,
-                        kp_ids=list(all_weak_kp_ids),
-                        limit_per_kp=3,
-                    )
-                    for diag in diagnoses:
-                        diag_evidence = {}
-                        for kp_id in diag.get("weak_kp_ids", []):
-                            chunks = evidence_map.get(str(kp_id), [])
-                            if chunks:
-                                diag_evidence[str(kp_id)] = chunks
-                        if diag_evidence:
-                            diag["evidence_chunks"] = diag_evidence
 
                 await session.commit()
                 logger.info(f"[test/submit] persisted session={session_id}")
