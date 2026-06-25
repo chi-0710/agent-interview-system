@@ -50,7 +50,8 @@ function createCustomRenderers(errorTags, currentHeaders) {
           : '');
 
       const className = codeEl?.props?.className || '';
-      const lang = className.replace('language-', '') || 'code';
+      const langMatch = className.match(/language-(\w+)/);
+      const lang = langMatch ? langMatch[1] : 'code';
 
       return (
         <div className="relative group/code">
