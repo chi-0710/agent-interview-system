@@ -1,9 +1,13 @@
 """学习规划与自适应出题路由
 
-- POST /api/learning/next-session  → 生成下一个练习会话
-- GET  /api/learning/sessions       → 练习会话列表
-- GET  /api/learning/plans          → 学习计划列表
-- POST /api/learning/plans          → 创建学习计划
+- POST /api/learning/next-session     → 生成下一个练习会话
+- GET  /api/learning/sessions          → 练习会话列表
+- GET  /api/learning/plans             → 学习计划列表
+- POST /api/learning/plans             → 创建学习计划
+- GET  /api/learning/mastery           → 用户掌握度列表
+- GET  /api/learning/review-tasks      → 复习任务列表
+- GET  /api/learning/weak-points       → 薄弱知识点列表
+- POST /api/learning/review-tasks/{id}/complete → 完成复习任务
 """
 import logging
 from typing import Optional, List
@@ -197,6 +201,7 @@ async def complete_review_task(task_id: str):
             )
             if result is None:
                 raise HTTPException(status_code=404, detail=f"Review task {task_id} not found")
+            await session.commit()
             return result
     except HTTPException:
         raise

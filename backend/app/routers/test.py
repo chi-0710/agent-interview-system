@@ -388,6 +388,7 @@ async def submit_test(req: SubmitRequest) -> dict:
     mastery_updates = {}
     review_tasks = []
     weak_points = []
+    persist_error = None
 
     if used_db:
         try:
@@ -542,6 +543,7 @@ async def submit_test(req: SubmitRequest) -> dict:
 
         except Exception as e:
             logger.error(f"[test/submit] persist error: {e}", exc_info=True)
+            persist_error = str(e)
 
     # ========== Step 7: 生成 summary ==========
     avg_score = sum(scores) / len(scores) if scores else 0
@@ -569,6 +571,8 @@ async def submit_test(req: SubmitRequest) -> dict:
         "masteryUpdates": mastery_updates,
         "reviewTasks": review_tasks,
         "weakPoints": weak_points,
+        "persistenceStatus": "failed" if persist_error else "ok",
+        "persistenceMessage": persist_error or "学习记录已保存",
     }
 
     return response

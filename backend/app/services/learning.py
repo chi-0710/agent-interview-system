@@ -30,6 +30,7 @@ from app.models import (
     PracticeSessionQuestion,
     MasteryEvent,
 )
+from app.services.mastery import get_mastery_service
 
 
 class LearningService:
@@ -180,6 +181,17 @@ class LearningService:
         masteries = mastery_result.scalars().all()
         mastery_map = {str(m.knowledge_point_id): m for m in masteries}
 
+        # 刷新遗忘衰减状态（可能在用户未查看掌握度页面时已超期）
+        now = datetime.utcnow()
+        mastery_service = get_mastery_service()
+        for m in masteries:
+            old_status = m.status
+            new_status = mastery_service.refresh_time_decay(m, now=now)
+            if old_status != new_status:
+                m.status = new_status
+                m.confidence = mastery_service._calculate_confidence(m)
+                m.review_due_at = mastery_service._calculate_review_due(m)
+
         # 查询前置依赖关系
         prereq_result = await db.execute(
             select(KnowledgeRelation).where(
@@ -213,7 +225,6 @@ class LearningService:
             if kp_id_str not in last_wrong_map:
                 last_wrong_map[kp_id_str] = created_at
 
-        now = datetime.utcnow()
         priorities = []
 
         for kp_id, kp in kp_map.items():
