@@ -1,4 +1,4 @@
-import React, { useMemo, useRef } from 'react';
+import React, { useMemo, useRef, useCallback, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
@@ -134,19 +134,25 @@ function createCustomRenderers(errorTags, currentHeaders) {
     // 标题 —— 跟踪当前 section 层级（同步到 store 供 AI 解释使用）
     h1({ children, ...props }) {
       currentHeaders.current = [String(children).toLowerCase()];
-      useAppStore.getState().setCurrentHeaders(currentHeaders.current);
+      useEffect(() => {
+        useAppStore.getState().setCurrentHeaders(currentHeaders.current);
+      });
       return <h1 className="dark:text-surface-100 dark:border-surface-700" {...props}>{children}</h1>;
     },
     h2({ children, ...props }) {
       const prev = currentHeaders.current || [];
       currentHeaders.current = [...prev.slice(0, 1), String(children).toLowerCase()];
-      useAppStore.getState().setCurrentHeaders(currentHeaders.current);
+      useEffect(() => {
+        useAppStore.getState().setCurrentHeaders(currentHeaders.current);
+      });
       return <h2 className="dark:text-surface-100" {...props}>{children}</h2>;
     },
     h3({ children, ...props }) {
       const prev = currentHeaders.current || [];
       currentHeaders.current = [...prev.slice(0, 2), String(children).toLowerCase()];
-      useAppStore.getState().setCurrentHeaders(currentHeaders.current);
+      useEffect(() => {
+        useAppStore.getState().setCurrentHeaders(currentHeaders.current);
+      });
       return <h3 className="dark:text-surface-200" {...props}>{children}</h3>;
     },
 
