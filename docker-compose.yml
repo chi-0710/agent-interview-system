@@ -41,6 +41,7 @@ services:
         echo 'Waiting for PostgreSQL to be ready...' &&
         alembic upgrade head &&
         echo 'Database migrations completed.' &&
+        python scripts/seed_docs.py &&
         uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
       "
 

@@ -1,5 +1,10 @@
 import asyncio
+import os
+import sys
 from logging.config import fileConfig
+
+# 确保项目根目录（/app）在 sys.path 中，解决容器内 alembic 无法导入 app 包的问题
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
