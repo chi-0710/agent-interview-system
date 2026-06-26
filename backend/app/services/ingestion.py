@@ -9,14 +9,16 @@
 5. 向量化并写入 ChromaDB
 
 v2: 支持按知识库隔离，支持任意文本内容导入
+v3: 支持多格式（PDF/DOCX/PPTX/代码）通过 parsers 层解析
 """
 import os
 import glob
 import uuid
 from typing import List, Optional
 
-from app.services.chunker import chunk_markdown, Chunk
+from app.services.chunker import chunk_markdown, chunk_parsed_document, Chunk
 from app.services.vector_store import add_chunks, delete_by_file, delete_by_knowledge_base
+from app.services.parsers import parse_file, is_code_file
 
 
 def _scan_md_files(docs_dir: str) -> List[str]:
@@ -126,7 +128,12 @@ def ingest_docs(
 
 
 async def _write_to_db(chunks_data: list, db_session, knowledge_base_id: Optional[str] = None, owner_id: Optional[str] = None):
-    """异步写入 PostgreSQL：Document + DocumentChunk + ChunkKnowledgeLink"""
+    """异步写入 PostgreSQL：Document + DocumentChunk + ChunkKnowledgeLink
+
+    支持两种数据格式：
+    - (Chunk, vpath, title, content)  — 旧格式兼容
+    - (Chunk, vpath, title, content, ParsedDocument)  — 新格式（v3 多格式）
+    """
     from app.models import Document, DocumentChunk, ChunkKnowledgeLink, KnowledgePoint
     from sqlalchemy import select
 
@@ -137,13 +144,26 @@ async def _write_to_db(chunks_data: list, db_session, knowledge_base_id: Optiona
     )
     all_kps = kp_result.scalars().all()
 
-    files_map = {}  # vpath -> {"title": "", "content": "", "chunks": []}
-    for c, vpath, title, content in chunks_data:
+    files_map = {}  # vpath -> {"title": "", "content": "", "chunks": [], "parsed": None}
+    for item in chunks_data:
+        if len(item) == 5:
+            c, vpath, title, content, parsed = item
+        else:
+            c, vpath, title, content = item
+            parsed = None
+
         if vpath not in files_map:
-            files_map[vpath] = {"title": title, "content": content, "chunks": []}
+            files_map[vpath] = {
+                "title": title,
+                "content": content,
+                "chunks": [],
+                "parsed": parsed,
+            }
         files_map[vpath]["chunks"].append(c)
 
     for vpath, info in files_map.items():
+        parsed = info.get("parsed")
+
         result = await db_session.execute(
             select(Document).where(Document.file_path == vpath)
         )
@@ -152,6 +172,12 @@ async def _write_to_db(chunks_data: list, db_session, knowledge_base_id: Optiona
         if doc:
             doc.title = info["title"]
             doc.content = info["content"]
+            if parsed:
+                doc.file_type = parsed.file_type
+                if parsed.source_path:
+                    doc.source_uri = parsed.source_path
+                if parsed.metadata:
+                    doc.source_metadata = parsed.metadata
             if knowledge_base_id:
                 doc.knowledge_base_id = knowledge_base_id
             from sqlalchemy import delete
@@ -166,14 +192,23 @@ async def _write_to_db(chunks_data: list, db_session, knowledge_base_id: Optiona
                 delete(DocumentChunk).where(DocumentChunk.document_id == doc.id)
             )
         else:
+            file_type = parsed.file_type if parsed else "md"
             doc = Document(
                 title=info["title"],
                 content=info["content"],
-                file_type="md",
+                file_type=file_type,
                 file_path=vpath,
                 knowledge_base_id=knowledge_base_id,
                 owner_id=owner_id or "default_user",
             )
+            if parsed:
+                doc.source_type = parsed.metadata.get("source_type", "upload") if parsed.metadata else "upload"
+                if parsed.source_path:
+                    doc.source_uri = parsed.source_path
+                if parsed.metadata:
+                    doc.source_metadata = parsed.metadata
+                if hasattr(parsed, 'source_uri') and parsed.source_uri:
+                    doc.source_uri = parsed.source_uri
             db_session.add(doc)
             await db_session.flush()
 
@@ -309,11 +344,11 @@ async def ingest_knowledge_base(
     db_session,
 ) -> dict:
     """
-    按知识库隔离的入库流程。
+    按知识库隔离的入库流程（v3: 支持多格式文件）。
 
     Args:
         knowledge_base_id: 知识库 UUID
-        file_infos: [{filename, content, file_type}, ...]
+        file_infos: [{filename, local_path, extension, file_type}, ...]
         db_session: 数据库会话
 
     Returns:
@@ -339,46 +374,47 @@ async def ingest_knowledge_base(
 
     for fi in file_infos:
         filename = fi["filename"]
-        content = fi["content"]
+        local_path = fi.get("local_path", "")
         file_type = fi.get("file_type", "md")
         vpath = f"/kb/{knowledge_base_id}/{filename}"
 
-        title = _extract_title(content, filename)
-        if title == os.path.splitext(filename)[0]:
-            title = _format_title_from_filename(filename)
+        # 通过统一解析层解析文件
+        parse_result = await parse_file(
+            local_path=local_path,
+            filename=filename,
+            file_type=file_type,
+        )
+        parsed = parse_result.document
 
-        if file_type in ("md", "txt"):
-            chunks = chunk_markdown(
-                file_path=vpath,
-                content=content,
-                chunk_size=800,
-                chunk_overlap=150,
-            )
-        else:
-            chunks = chunk_markdown(
-                file_path=vpath,
-                content=content,
-                chunk_size=800,
-                chunk_overlap=150,
-            )
+        title = parsed.title
+        content = parsed.content
+
+        # 切片（代码文件按结构切片，文档沿用 chunk_markdown）
+        chunks = chunk_parsed_document(
+            parsed=parsed,
+            chunk_size=800,
+            chunk_overlap=150,
+        )
 
         result["files"].append({
             "filename": filename,
             "title": title,
             "chunks": len(chunks),
             "status": "processed",
+            "warnings": parse_result.warnings,
         })
 
         for c in chunks:
             c.metadata["knowledge_base_id"] = str(knowledge_base_id)
             c.metadata["document_filename"] = filename
-            all_chunks_data.append((c, vpath, title, content))
+            c.metadata["file_type"] = parsed.file_type
+            all_chunks_data.append((c, vpath, title, content, parsed))
 
         result["total_chunks"] += len(chunks)
         documents_created.append({
             "title": title,
             "content": content,
-            "file_type": file_type,
+            "file_type": parsed.file_type,
             "file_path": vpath,
             "filename": filename,
         })

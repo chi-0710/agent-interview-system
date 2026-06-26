@@ -195,3 +195,89 @@ def chunk_markdown(
     _flush_buffer()
 
     return chunks
+
+
+def chunk_parsed_document(
+    parsed,
+    chunk_size: int = 800,
+    chunk_overlap: int = 150,
+) -> List[Chunk]:
+    """对解析后的文档进行切片。
+
+    代码文件：按 ## 结构标题边界切片，确保每个类/函数独立成块
+    文档文件（md/txt/pdf/docx/pptx）：沿用 chunk_markdown 逻辑
+    """
+    from app.services.parsers import is_code_file
+
+    file_path = parsed.source_path or parsed.filename
+
+    if is_code_file(parsed.file_type):
+        return _chunk_code_by_structure(
+            content=parsed.content,
+            file_path=file_path,
+        )
+    else:
+        return chunk_markdown(
+            file_path=file_path,
+            content=parsed.content,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+
+
+def _chunk_code_by_structure(content: str, file_path: str) -> List[Chunk]:
+    """代码文件按 ## 结构标题边界切片，每块一个类/函数，不按字符数硬切"""
+    lines = content.split("\n")
+    chunks: List[Chunk] = []
+    current_lines: List[str] = []
+    current_headers: List[str] = []
+    current_start: int = 1
+
+    for line_num, line in enumerate(lines, start=1):
+        header = _is_header_line(line)
+        if header:
+            level, text = header
+
+            # 保存前一块
+            if current_lines:
+                chunk_text = "\n".join(current_lines)
+                chunks.append(Chunk(
+                    text=chunk_text,
+                    metadata={
+                        "file_path": file_path,
+                        "headers": list(current_headers),
+                        "line_start": current_start,
+                        "line_end": line_num - 1,
+                    }
+                ))
+                current_lines = []
+
+            # 更新 headers（小写，与 SmartReader 一致）
+            h_text = text.lower()
+            if level == 1:
+                current_headers = [h_text]
+            elif level == 2:
+                prev = current_headers if current_headers else []
+                current_headers = prev[:1] + [h_text]
+            else:
+                prev = current_headers if current_headers else []
+                current_headers = prev[:2] + [h_text]
+
+            current_start = line_num
+
+        current_lines.append(line)
+
+    # 最后一块
+    if current_lines:
+        chunk_text = "\n".join(current_lines)
+        chunks.append(Chunk(
+            text=chunk_text,
+            metadata={
+                "file_path": file_path,
+                "headers": list(current_headers),
+                "line_start": current_start,
+                "line_end": len(lines),
+            }
+        ))
+
+    return chunks

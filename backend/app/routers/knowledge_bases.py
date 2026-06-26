@@ -22,6 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db, async_session_factory
 from app.dependencies import CurrentUser, get_current_user
 from app.models import KnowledgeBase, ImportJob, Document
+from app.services.parsers import detect_file_type, is_code_file
+from app.services.parsers.storage import save_upload_file
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/knowledge-bases", tags=["knowledge-bases"])
@@ -282,11 +284,19 @@ async def upload_documents(
 
     file_infos = []
     job_file_details = []
-    allowed_extensions = {".md", ".txt", ".markdown"}
+    allowed_extensions = {
+        ".md", ".markdown", ".txt",
+        ".pdf",
+        ".docx", ".doc",
+        ".pptx", ".ppt",
+        ".py", ".js", ".jsx", ".ts", ".tsx",
+        ".java", ".go", ".c", ".h", ".cpp",
+        ".cs", ".sql", ".json", ".yaml", ".yml",
+        ".html", ".css", ".sh",
+    }
 
     for f in files:
         filename = f.filename or "unknown"
-        content_bytes = await f.read()
         ext = os.path.splitext(filename)[1].lower()
 
         if ext not in allowed_extensions:
@@ -298,26 +308,20 @@ async def upload_documents(
             })
             continue
 
-        try:
-            content = content_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            try:
-                content = content_bytes.decode("gbk")
-            except Exception:
-                job_file_details.append({
-                    "upload_id": str(uuid.uuid4()),
-                    "filename": filename,
-                    "status": "failed",
-                    "error": "无法解码文件内容",
-                })
-                continue
+        # 保存文件到磁盘，不直接解码二进制内容
+        raw_path = await save_upload_file(
+            upload_file=f,
+            knowledge_base_id=knowledge_base_id,
+            job_id=str(job.id),
+        )
 
-        file_type = "md" if ext in (".md", ".markdown") else "txt"
+        file_type = detect_file_type(filename)
         upload_id = str(uuid.uuid4())
         file_infos.append({
             "upload_id": upload_id,
             "filename": filename,
-            "content": content,
+            "local_path": str(raw_path),
+            "extension": ext,
             "file_type": file_type,
         })
         job_file_details.append({

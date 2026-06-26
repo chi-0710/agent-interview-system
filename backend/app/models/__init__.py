@@ -67,8 +67,17 @@ class Document(Base):
     owner_id = Column(String(100), nullable=False, default="default_user", index=True)
     title = Column(String(500), nullable=False)
     content = Column(Text, nullable=False)
-    file_type = Column(String(50), nullable=False)  # pdf, docx, txt, md
+    file_type = Column(String(50), nullable=False)  # pdf, docx, pptx, txt, md, py, js, ...
     file_path = Column(String(1000), nullable=True)
+
+    # 来源元数据（支持多格式和 Git 仓库）
+    source_type = Column(String(30), nullable=False, default="upload")  # upload, git_repository, generated
+    source_uri = Column(String(2000), nullable=True)  # Git 地址、原始文件路径、网页 URL
+    content_hash = Column(String(64), nullable=True)  # SHA-256，用于去重
+    source_metadata = Column(JSON, nullable=True)     # commit SHA、分支、页数、语言等
+    parse_status = Column(String(30), nullable=False, default="ready")  # ready, partial, needs_ocr, failed
+    parse_warning = Column(Text, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
