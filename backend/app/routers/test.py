@@ -17,7 +17,7 @@ from sqlalchemy import select
 
 from app.database import get_db, async_session_factory
 from app.dependencies import CurrentUser, get_current_user
-from app.models import TestSession, TestAnswer, Question, Diagnosis, KnowledgePoint, QuestionKnowledgeLink
+from app.models import TestSession, TestAnswer, Question, Diagnosis, KnowledgePoint, QuestionKnowledgeLink, PracticeSession, PracticeSessionQuestion, Document
 from app.services.evaluator import evaluate_answer as evaluate_single
 from app.services.evaluator import evaluate_code_answer
 from app.services.error_tags import aggregate_error_tags
@@ -45,17 +45,13 @@ class AnswerItem(BaseModel):
 
 
 class SubmitRequest(BaseModel):
-    file_path: str
     answers: List[AnswerItem] = []
+    # 自适应练习会话 ID（推荐）：由 /api/learning/next-session 生成，用于学习闭环
+    practice_session_id: Optional[str] = None
+    # file_path 仅作为无练习会话时的向后兼容字段（用于错题 chunk 解析）
+    file_path: Optional[str] = None
     session_id: Optional[str] = None  # 可选：属于某个练习会话
     mode: Optional[str] = "learn"  # learn | mock_interview
-
-    @field_validator("file_path")
-    @classmethod
-    def fp_not_empty(cls, v):
-        if not v or not v.strip():
-            raise ValueError("file_path 不能为空")
-        return v.strip()
 
     @field_validator("answers")
     @classmethod
@@ -236,6 +232,41 @@ async def submit_test(
     diagnosis_service = get_diagnosis_service()
     mastery_service = get_mastery_service()
 
+    # ========== Step 0: 处理练习会话（practice_session_id） ==========
+    # 约束：测试接口应以 practice_session_id + answers 作为输入，而非 file_path。
+    # 当提供 practice_session_id 时：校验归属、从会话题目反查 file_path 用于错题解析。
+    derived_file_path = req.file_path
+    practice_session_obj = None
+    if req.practice_session_id:
+        try:
+            async with async_session_factory() as session:
+                ps_result = await session.execute(
+                    select(PracticeSession).where(
+                        PracticeSession.id == req.practice_session_id,
+                        PracticeSession.user_id == current_user.user_id,
+                    )
+                )
+                practice_session_obj = ps_result.scalar_one_or_none()
+                if not practice_session_obj:
+                    raise HTTPException(status_code=404, detail="练习会话不存在或无权访问")
+
+                # 反查会话题目关联的文档 file_path（用于错题 chunk 解析）
+                if not derived_file_path:
+                    doc_result = await session.execute(
+                        select(Document.file_path)
+                        .join(Question, Question.document_id == Document.id)
+                        .join(PracticeSessionQuestion, PracticeSessionQuestion.question_id == Question.id)
+                        .where(PracticeSessionQuestion.session_id == practice_session_obj.id)
+                        .limit(1)
+                    )
+                    row = doc_result.first()
+                    if row and row[0]:
+                        derived_file_path = row[0]
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"[test/submit] 加载练习会话失败: {e}")
+
     # ========== Step 1: 加载题目 ==========
     questions = None
     used_db = False
@@ -383,7 +414,8 @@ async def submit_test(
         })
 
     # ========== Step 5: 聚合 errorTags（向后兼容） ==========
-    error_tags = aggregate_error_tags(enriched_evals, req.file_path)
+    # file_path 优先使用从练习会话反查得到的 derived_file_path
+    error_tags = aggregate_error_tags(enriched_evals, derived_file_path)
 
     # ========== Step 6: 持久化 + 更新掌握度 + 生成复习任务（DB 模式） ==========
     session_id = None
@@ -409,6 +441,20 @@ async def submit_test(
                 session.add(test_session)
                 await session.flush()
                 session_id = str(test_session.id)
+
+                # 6.1.1 若关联了练习会话，标记为已完成并回写得分
+                if req.practice_session_id:
+                    ps_result = await session.execute(
+                        select(PracticeSession).where(
+                            PracticeSession.id == req.practice_session_id,
+                            PracticeSession.user_id == current_user.user_id,
+                        )
+                    )
+                    ps_obj = ps_result.scalar_one_or_none()
+                    if ps_obj:
+                        ps_obj.status = "completed"
+                        ps_obj.score = round(sum(scores) / len(scores), 1) if scores else 0
+                        ps_obj.completed_at = datetime.utcnow()
 
                 # 6.2 保存每道题的作答记录
                 answer_records = {}
@@ -654,10 +700,20 @@ async def get_session(session_id: str, current_user: CurrentUser = Depends(get_c
 
 
 @router.get("/sessions/{session_id}/answers")
-async def list_answers(session_id: str):
+async def list_answers(session_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """获取会话的所有作答记录（含诊断）"""
     try:
         async with async_session_factory() as session:
+            # 用户隔离：通过 TestSession.user_id 校验会话归属
+            ts_result = await session.execute(
+                select(TestSession).where(
+                    TestSession.id == session_id,
+                    TestSession.user_id == current_user.user_id,
+                )
+            )
+            if not ts_result.scalar_one_or_none():
+                raise HTTPException(status_code=404, detail="会话不存在或无权访问")
+
             result = await session.execute(
                 select(TestAnswer)
                 .where(TestAnswer.session_id == session_id)
@@ -678,6 +734,8 @@ async def list_answers(session_id: str):
                 }
                 for a in answers
             ]
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning(f"[test/answers] DB error: {e}")
     return []

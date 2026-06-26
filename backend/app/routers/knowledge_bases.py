@@ -16,7 +16,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Depends
 from pydantic import BaseModel
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db, async_session_factory
@@ -112,8 +112,7 @@ async def list_knowledge_bases(
         doc_count_result = await db.execute(
             select(func.count(Document.id)).where(Document.knowledge_base_id == None)
         )
-        default_doc_count = doc_count_result.scalar() or 0
-        default_kb["document_count"] = default_doc_count
+        default_kb["document_count"] = doc_count_result.scalar() or 0
     except Exception:
         pass
 
@@ -124,6 +123,7 @@ async def list_knowledge_bases(
 async def get_knowledge_base(
     knowledge_base_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """获取单个知识库详情"""
     if knowledge_base_id == "default":
@@ -140,7 +140,10 @@ async def get_knowledge_base(
         }
 
     result = await db.execute(
-        select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
+        select(KnowledgeBase).where(
+            KnowledgeBase.id == knowledge_base_id,
+            KnowledgeBase.owner_id == current_user.user_id,
+        )
     )
     kb = result.scalar_one_or_none()
     if not kb:
@@ -152,13 +155,17 @@ async def get_knowledge_base(
 async def delete_knowledge_base(
     knowledge_base_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """删除知识库及其所有关联数据"""
     if knowledge_base_id == "default":
         raise HTTPException(status_code=400, detail="不能删除默认知识库")
 
     result = await db.execute(
-        select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
+        select(KnowledgeBase).where(
+            KnowledgeBase.id == knowledge_base_id,
+            KnowledgeBase.owner_id == current_user.user_id,
+        )
     )
     kb = result.scalar_one_or_none()
     if not kb:
@@ -253,13 +260,17 @@ async def upload_documents(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """上传文件到知识库，立即返回 job_id，后台异步处理导入"""
     if knowledge_base_id == "default":
         raise HTTPException(status_code=400, detail="默认知识库不支持直接上传")
 
     result = await db.execute(
-        select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
+        select(KnowledgeBase).where(
+            KnowledgeBase.id == knowledge_base_id,
+            KnowledgeBase.owner_id == current_user.user_id,
+        )
     )
     kb = result.scalar_one_or_none()
     if not kb:
@@ -373,8 +384,20 @@ async def get_import_job(
     knowledge_base_id: str,
     job_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """查询导入任务进度"""
+    # 校验知识库归属当前用户（default 知识库不支持导入任务）
+    if knowledge_base_id != "default":
+        kb_result = await db.execute(
+            select(KnowledgeBase).where(
+                KnowledgeBase.id == knowledge_base_id,
+                KnowledgeBase.owner_id == current_user.user_id,
+            )
+        )
+        if not kb_result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="知识库不存在")
+
     result = await db.execute(
         select(ImportJob).where(
             ImportJob.id == job_id,
@@ -403,13 +426,31 @@ async def get_import_job(
 async def get_knowledge_base_tree(
     knowledge_base_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """获取知识库内文件树"""
     if knowledge_base_id == "default":
+        # 默认知识库：返回当前用户的未归类文档 + 共享预置文档（owner_id 为 NULL 或 "__shared__"）
         result = await db.execute(
-            select(Document).where(Document.knowledge_base_id == None)
+            select(Document).where(
+                Document.knowledge_base_id == None,
+                or_(
+                    Document.owner_id == current_user.user_id,
+                    Document.owner_id == None,
+                    Document.owner_id == "__shared__",
+                ),
+            )
         )
     else:
+        # 自定义知识库：先校验归属，再查询文档
+        kb_result = await db.execute(
+            select(KnowledgeBase).where(
+                KnowledgeBase.id == knowledge_base_id,
+                KnowledgeBase.owner_id == current_user.user_id,
+            )
+        )
+        if not kb_result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="知识库不存在")
         result = await db.execute(
             select(Document).where(Document.knowledge_base_id == knowledge_base_id)
         )

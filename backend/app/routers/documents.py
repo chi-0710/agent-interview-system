@@ -11,11 +11,12 @@ import shutil
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Query, HTTPException, UploadFile, File
+from fastapi import APIRouter, Query, HTTPException, UploadFile, File, Depends
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.database import get_db
+from app.dependencies import CurrentUser, get_current_user
 from app.models import Document
 
 logger = logging.getLogger(__name__)
@@ -194,19 +195,26 @@ def _build_file_tree_from_fs(docs_dir: str) -> list[dict]:
 
 
 @router.get("")
-async def list_documents():
+async def list_documents(current_user: CurrentUser = Depends(get_current_user)):
     """获取文件树（优先从 PostgreSQL，回退到文件系统）"""
     try:
         from app.database import async_session_factory
         async with async_session_factory() as session:
-            result = await session.execute(select(Document))
+            # 用户隔离：只返回当前用户拥有的文档 + 共享预置文档（owner_id 为 NULL 或 "__shared__"）
+            result = await session.execute(
+                select(Document).where(
+                    (Document.owner_id == current_user.user_id)
+                    | (Document.owner_id == None)
+                    | (Document.owner_id == "__shared__")
+                )
+            )
             docs = result.scalars().all()
             if docs:
                 return _build_file_tree(list(docs))
     except Exception:
         pass
 
-    # 回退：从文件系统扫描
+    # 回退：从文件系统扫描（共享文档，不区分用户）
     base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     docs_dir = os.path.join(base_dir, "docs")
     if os.path.isdir(docs_dir):
@@ -217,14 +225,22 @@ async def list_documents():
 
 
 @router.get("/content")
-async def get_document_content(path: str = Query(..., description="文档虚拟路径，如 /docs/cs/os-memory.md")):
+async def get_document_content(
+    path: str = Query(..., description="文档虚拟路径，如 /docs/cs/os-memory.md"),
+    current_user: CurrentUser = Depends(get_current_user),
+):
     """获取文档完整 Markdown 内容"""
-    # 优先从数据库读取
+    # 优先从数据库读取（用户隔离：只允许读取自己的或共享的文档）
     try:
         from app.database import async_session_factory
         async with async_session_factory() as session:
             result = await session.execute(
-                select(Document).where(Document.file_path == path)
+                select(Document).where(
+                    Document.file_path == path,
+                    (Document.owner_id == current_user.user_id)
+                    | (Document.owner_id == None)
+                    | (Document.owner_id == "__shared__"),
+                )
             )
             doc = result.scalar_one_or_none()
             if doc:

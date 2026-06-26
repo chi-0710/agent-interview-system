@@ -169,11 +169,54 @@ const useAppStore = create((set, get) => ({
   chatMessages: [],
   /** @type {boolean} */
   isStreaming: false,
+  /** @type {string | null} 后端会话 ID，用于多轮对话记忆（仅存 session_id，状态由后端持久化） */
+  copilotSessionId: null,
 
   addChatMessage: (msg) =>
     set((s) => ({ chatMessages: [...s.chatMessages, msg] })),
   setStreaming: (v) => set({ isStreaming: v }),
-  clearChat: () => set({ chatMessages: [], isStreaming: false }),
+  setCopilotSessionId: (id) => set({ copilotSessionId: id }),
+
+  /**
+   * 确保存在一个 copilot 会话：无则创建，有则复用。
+   * 会话状态由后端持久化，前端只保存 session_id。
+   */
+  ensureCopilotSession: async () => {
+    const { copilotSessionId } = get();
+    if (copilotSessionId) return copilotSessionId;
+    try {
+      const resp = await fetch('/api/copilot/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.session_id) {
+          set({ copilotSessionId: data.session_id });
+          return data.session_id;
+        }
+      }
+    } catch (e) {
+      console.error('[store] ensure copilot session failed:', e);
+    }
+    return null;
+  },
+
+  /**
+   * 清空对话：调用后端清理接口重置会话历史，并清空本地消息。
+   */
+  clearChat: async () => {
+    const { copilotSessionId } = get();
+    if (copilotSessionId) {
+      try {
+        await fetch(`/api/copilot/session/${copilotSessionId}/clear`, { method: 'POST' });
+      } catch (e) {
+        console.error('[store] clear copilot session failed:', e);
+      }
+    }
+    set({ chatMessages: [], isStreaming: false });
+  },
 
   // ========== 错题热力图 ==========
   /**

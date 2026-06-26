@@ -88,6 +88,7 @@ export default function CopilotPanel() {
   const addChatMessage = useAppStore((s) => s.addChatMessage);
   const setStreaming = useAppStore((s) => s.setStreaming);
   const clearChat = useAppStore((s) => s.clearChat);
+  const ensureCopilotSession = useAppStore((s) => s.ensureCopilotSession);
   const messagesEndRef = useRef(null);
 
   const [input, setInput] = React.useState('');
@@ -96,9 +97,12 @@ export default function CopilotPanel() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
 
-  const handleSend = () => {
+  const handleSend = async () => {
     const text = input.trim();
     if (!text || isStreaming) return;
+
+    // 确保存在后端会话，用于多轮对话记忆（前端只存 session_id）
+    const sessionId = await ensureCopilotSession();
 
     addChatMessage({ role: 'user', content: text });
     setInput('');
@@ -112,6 +116,7 @@ export default function CopilotPanel() {
         message: text,
         file_path: activeFile?.path || '',
         knowledge_base_id: activeKnowledgeBaseId || null,
+        session_id: sessionId,
       },
       (chunk) => {
         accumulated += chunk;

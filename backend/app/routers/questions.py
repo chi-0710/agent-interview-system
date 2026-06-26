@@ -4,16 +4,21 @@
 - GET  /api/questions?file=xxx  → 按文件筛选题目
 - POST /api/questions           → 创建题目
 """
-from fastapi import APIRouter, Query
-from sqlalchemy import select
+from fastapi import APIRouter, Query, Depends
+from sqlalchemy import select, or_
 import logging
+
+from app.dependencies import CurrentUser, get_current_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/questions", tags=["questions"])
 
 
 @router.get("")
-async def list_questions(file: str = Query(None, description="文档路径，如 /docs/cs/os-memory.md")):
+async def list_questions(
+    file: str = Query(None, description="文档路径，如 /docs/cs/os-memory.md"),
+    current_user: CurrentUser = Depends(get_current_user),
+):
     """
     获取题目列表。可选按 file_path 过滤。
 
@@ -25,9 +30,16 @@ async def list_questions(file: str = Query(None, description="文档路径，如
 
         async with async_session_factory() as session:
             if file:
-                # 先查 document
+                # 先查 document（用户隔离：只匹配自己的或共享的文档）
                 doc_result = await session.execute(
-                    select(Document).where(Document.file_path == file)
+                    select(Document).where(
+                        Document.file_path == file,
+                        or_(
+                            Document.owner_id == current_user.user_id,
+                            Document.owner_id == None,
+                            Document.owner_id == "__shared__",
+                        ),
+                    )
                 )
                 doc = doc_result.scalar_one_or_none()
                 if doc:
@@ -38,7 +50,13 @@ async def list_questions(file: str = Query(None, description="文档路径，如
                 else:
                     questions = []
             else:
-                result = await session.execute(select(Question))
+                # 用户隔离：只返回归属于当前用户文档的题目，以及无文档关联的共享题目
+                user_doc_ids = select(Document.id).where(Document.owner_id == current_user.user_id)
+                result = await session.execute(
+                    select(Question).where(
+                        or_(Question.document_id.in_(user_doc_ids), Question.document_id == None)
+                    )
+                )
                 questions = result.scalars().all()
 
             return [
@@ -133,15 +151,24 @@ async def list_questions(file: str = Query(None, description="文档路径，如
 
 
 @router.get("/{question_id}")
-async def get_question(question_id: str):
+async def get_question(question_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """获取单个题目"""
     try:
         from app.database import async_session_factory
-        from app.models import Question
+        from app.models import Question, Document
 
         async with async_session_factory() as session:
+            # 用户隔离：题目关联的文档须为当前用户所有，或为共享题目（document_id 为空）
             result = await session.execute(
-                select(Question).where(Question.id == question_id)
+                select(Question).where(
+                    Question.id == question_id,
+                    or_(
+                        Question.document_id == None,
+                        Question.document_id.in_(
+                            select(Document.id).where(Document.owner_id == current_user.user_id)
+                        ),
+                    ),
+                )
             )
             q = result.scalar_one_or_none()
             if q:

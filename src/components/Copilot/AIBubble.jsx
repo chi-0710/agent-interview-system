@@ -16,6 +16,7 @@ export default function AIBubble() {
   const addChatMessage = useAppStore((s) => s.addChatMessage);
   const setStreaming = useAppStore((s) => s.setStreaming);
   const isStreaming = useAppStore((s) => s.isStreaming);
+  const ensureCopilotSession = useAppStore((s) => s.ensureCopilotSession);
 
   const [position, setPosition] = React.useState({ x: 0, y: 0 });
 
@@ -25,13 +26,16 @@ export default function AIBubble() {
     }
   }, [selection]);
 
-  const handleClick = (e) => {
+  const handleClick = async (e) => {
     e.stopPropagation();
     if (isStreaming) return;
 
     const selectedText = selection.fullText || selection.text;
     const filePath = activeFile?.path || '';
     const blockContext = selection.blockContext || null; // 新增：完整段落上下文
+
+    // 确保存在后端会话（前端只存 session_id，状态由后端持久化）
+    const sessionId = await ensureCopilotSession();
 
     const userMsg = {
       role: 'user',
@@ -51,6 +55,7 @@ export default function AIBubble() {
         knowledge_base_id: activeKnowledgeBaseId || null,
         headers: currentHeaders || [],
         block_context: blockContext,
+        session_id: sessionId,
       },
       (chunk) => {
         accumulated += chunk;

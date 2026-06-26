@@ -24,8 +24,10 @@ export default function TestMode() {
   const [questions, setQuestions] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  // 练习会话 ID（由 /api/learning/next-session 生成），提交测试时携带，用于学习闭环
+  const [practiceSessionId, setPracticeSessionId] = useState(null);
 
-  // 加载题目
+  // 加载题目：优先使用自适应练习会话，无知识点数据时回退到按文件加载
   useEffect(() => {
     if (!activeFile) {
       setQuestions([]);
@@ -39,17 +41,47 @@ export default function TestMode() {
     setAnswers({});
     setSubmitted(false);
     setFeedback(null);
+    setPracticeSessionId(null);
 
-    fetch(`/api/questions?file=${encodeURIComponent(activeFile.path)}`)
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
-      .then((data) => {
-        setQuestions(data);
+    // 1. 尝试自适应出题（学习闭环主路径）
+    fetch('/api/learning/next-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'adaptive', count: 5 }),
+    })
+      .then((r) => r.ok ? r.json() : null)
+      .then(async (data) => {
+        if (data && data.session_id && data.questions && data.questions.length > 0) {
+          setPracticeSessionId(data.session_id);
+          // next-session 返回的题目字段适配为 TestMode 使用的结构
+          const adapted = data.questions.map((q) => ({
+            id: q.id,
+            type: q.type || 'text',
+            question: q.content,
+            options: q.options,
+            difficulty: q.difficulty,
+          }));
+          setQuestions(adapted);
+          setLoading(false);
+          return;
+        }
+        // 2. 回退：按文件加载题目（无 practice_session_id）
+        const r2 = await fetch(`/api/questions?file=${encodeURIComponent(activeFile.path)}`);
+        if (!r2.ok) throw new Error(`HTTP ${r2.status}`);
+        const data2 = await r2.json();
+        setQuestions(data2);
         setLoading(false);
       })
-      .catch((err) => {
+      .catch(async (err) => {
+        // 请求失败也回退到按文件加载
+        try {
+          const r2 = await fetch(`/api/questions?file=${encodeURIComponent(activeFile.path)}`);
+          if (r2.ok) {
+            setQuestions(await r2.json());
+            setLoading(false);
+            return;
+          }
+        } catch {}
         setError(err.message);
         setLoading(false);
       });
@@ -73,13 +105,19 @@ export default function TestMode() {
         user_answer: answers[q.id] || '',
       }));
 
+      // 约束：测试接口以 practice_session_id + answers 作为输入
+      // 有练习会话时携带 practice_session_id，否则回退 file_path（向后兼容）
+      const payload = { answers: submitAnswers };
+      if (practiceSessionId) {
+        payload.practice_session_id = practiceSessionId;
+      } else if (activeFile?.path) {
+        payload.file_path = activeFile.path;
+      }
+
       const resp = await fetch('/api/test/submit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          file_path: activeFile.path,
-          answers: submitAnswers,
-        }),
+        body: JSON.stringify(payload),
       });
 
       if (!resp.ok) {

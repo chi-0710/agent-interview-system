@@ -39,6 +39,7 @@ class ChatMessage:
 class ChatSession:
     """对话会话"""
     session_id: str
+    user_id: str  # 会话归属用户，用于多用户隔离
     file_path: Optional[str] = None  # 关联的文档路径
     messages: List[ChatMessage] = field(default_factory=list)
     summary: Optional[str] = None  # 历史对话摘要
@@ -85,24 +86,28 @@ class SessionManager:
         self._sessions: dict[str, ChatSession] = {}
         self._summary_lock: set[str] = set()  # 防止并发重复摘要
 
-    def create_session(self, file_path: Optional[str] = None) -> str:
+    def create_session(self, file_path: Optional[str] = None, user_id: str = "default_user") -> str:
         """创建新会话，返回 session_id"""
         session_id = str(uuid.uuid4())
-        session = ChatSession(session_id=session_id, file_path=file_path)
+        session = ChatSession(session_id=session_id, user_id=user_id, file_path=file_path)
         self._sessions[session_id] = session
-        logger.info(f"[session] created: {session_id}")
+        logger.info(f"[session] created: {session_id} (user={user_id})")
         return session_id
 
-    def get_session(self, session_id: str) -> Optional[ChatSession]:
-        """获取会话"""
+    def get_session(self, session_id: str, user_id: Optional[str] = None) -> Optional[ChatSession]:
+        """获取会话。传入 user_id 时校验归属，不匹配返回 None。"""
         session = self._sessions.get(session_id)
-        if session:
-            session.last_active = time.time()
+        if not session:
+            return None
+        # 用户隔离：传入 user_id 时必须匹配
+        if user_id is not None and session.user_id != user_id:
+            return None
+        session.last_active = time.time()
         return session
 
-    def add_user_message(self, session_id: str, content: str, file_path: Optional[str] = None) -> bool:
+    def add_user_message(self, session_id: str, content: str, file_path: Optional[str] = None, user_id: Optional[str] = None) -> bool:
         """添加用户消息"""
-        session = self.get_session(session_id)
+        session = self.get_session(session_id, user_id=user_id)
         if not session:
             return False
         if file_path and not session.file_path:
@@ -110,9 +115,9 @@ class SessionManager:
         session.add_message("user", content)
         return True
 
-    def add_assistant_message(self, session_id: str, content: str) -> bool:
+    def add_assistant_message(self, session_id: str, content: str, user_id: Optional[str] = None) -> bool:
         """添加助手消息"""
-        session = self.get_session(session_id)
+        session = self.get_session(session_id, user_id=user_id)
         if not session:
             return False
         session.add_message("assistant", content)
@@ -163,29 +168,33 @@ class SessionManager:
         finally:
             self._summary_lock.discard(session_id)
 
-    def get_context_messages(self, session_id: str) -> List[dict]:
+    def get_context_messages(self, session_id: str, user_id: Optional[str] = None) -> List[dict]:
         """获取 LLM 用的上下文消息列表"""
-        session = self.get_session(session_id)
+        session = self.get_session(session_id, user_id=user_id)
         if not session:
             return []
         return session.get_context_messages()
 
-    def clear_session(self, session_id: str) -> bool:
+    def clear_session(self, session_id: str, user_id: Optional[str] = None) -> bool:
         """清空会话消息（保留 session 本身）"""
-        session = self.get_session(session_id)
+        session = self.get_session(session_id, user_id=user_id)
         if not session:
             return False
         session.messages = []
         session.summary = None
         return True
 
-    def delete_session(self, session_id: str) -> bool:
+    def delete_session(self, session_id: str, user_id: Optional[str] = None) -> bool:
         """删除会话"""
-        if session_id in self._sessions:
-            del self._sessions[session_id]
-            logger.info(f"[session] deleted: {session_id}")
-            return True
-        return False
+        session = self._sessions.get(session_id)
+        if not session:
+            return False
+        # 用户隔离：传入 user_id 时必须匹配
+        if user_id is not None and session.user_id != user_id:
+            return False
+        del self._sessions[session_id]
+        logger.info(f"[session] deleted: {session_id}")
+        return True
 
     def cleanup_expired(self, ttl_seconds: int = 3600) -> int:
         """清理过期会话（1小时无活动）"""

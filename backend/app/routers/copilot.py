@@ -8,10 +8,11 @@ import json
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
+from app.dependencies import CurrentUser, get_current_user
 from app.services.copilot import explain_stream, chat_stream
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ class ExplainRequest(BaseModel):
     knowledge_base_id: Optional[str] = None
     headers: list[str] = []
     block_context: Optional[str] = None  # 新增：前端提取的完整段落上下文
+    session_id: Optional[str] = None  # 会话 ID，用于多轮对话记忆
 
     @field_validator("selected_text")
     @classmethod
@@ -68,7 +70,7 @@ async def _sse_event(event_type: str, content: str = ""):
 # ---- Routes ----
 
 @router.post("/explain")
-async def explain(request: ExplainRequest):
+async def explain(request: ExplainRequest, current_user: CurrentUser = Depends(get_current_user)):
     """
     划线伴读解释（SSE 流式）
 
@@ -145,6 +147,8 @@ async def explain(request: ExplainRequest):
                 headers=request.headers,
                 block_context=request.block_context,
                 knowledge_base_id=request.knowledge_base_id,
+                session_id=request.session_id,
+                user_id=current_user.user_id,
             ):
                 yield await _sse_event("chunk", token)
             yield await _sse_event("done")
@@ -178,7 +182,7 @@ async def explain(request: ExplainRequest):
 
 
 @router.post("/chat")
-async def copilot_chat(request: ChatRequest):
+async def copilot_chat(request: ChatRequest, current_user: CurrentUser = Depends(get_current_user)):
     """
     自由对话（SSE 流式）
 
@@ -193,6 +197,7 @@ async def copilot_chat(request: ChatRequest):
                 file_path=request.file_path,
                 session_id=request.session_id,
                 knowledge_base_id=request.knowledge_base_id,
+                user_id=current_user.user_id,
             ):
                 yield await _sse_event("chunk", token)
             yield await _sse_event("done")
@@ -219,21 +224,21 @@ class CreateSessionRequest(BaseModel):
 
 
 @router.post("/session")
-async def create_session(req: CreateSessionRequest = None):
+async def create_session(req: CreateSessionRequest = None, current_user: CurrentUser = Depends(get_current_user)):
     """创建新会话，返回 session_id"""
     from app.services.session_manager import get_session_manager
     mgr = get_session_manager()
     file_path = req.file_path if req else None
-    session_id = mgr.create_session(file_path=file_path)
+    session_id = mgr.create_session(file_path=file_path, user_id=current_user.user_id)
     return {"session_id": session_id}
 
 
 @router.get("/session/{session_id}")
-async def get_session(session_id: str):
+async def get_session(session_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """获取会话状态和历史消息"""
     from app.services.session_manager import get_session_manager
     mgr = get_session_manager()
-    session = mgr.get_session(session_id)
+    session = mgr.get_session(session_id, user_id=current_user.user_id)
     if not session:
         return {"error": "session not found"}
     return {
@@ -246,20 +251,20 @@ async def get_session(session_id: str):
 
 
 @router.delete("/session/{session_id}")
-async def delete_session(session_id: str):
+async def delete_session(session_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """删除会话"""
     from app.services.session_manager import get_session_manager
     mgr = get_session_manager()
-    ok = mgr.delete_session(session_id)
+    ok = mgr.delete_session(session_id, user_id=current_user.user_id)
     return {"deleted": ok}
 
 
 @router.post("/session/{session_id}/clear")
-async def clear_session(session_id: str):
+async def clear_session(session_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """清空会话消息"""
     from app.services.session_manager import get_session_manager
     mgr = get_session_manager()
-    ok = mgr.clear_session(session_id)
+    ok = mgr.clear_session(session_id, user_id=current_user.user_id)
     return {"cleared": ok}
 
 

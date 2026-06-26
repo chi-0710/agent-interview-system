@@ -107,6 +107,8 @@ async def explain_stream(
     block_context: Optional[str] = None,
     knowledge_base_id: Optional[str] = None,
     top_k: int = 3,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """
     流式解释选中文字。
@@ -118,6 +120,8 @@ async def explain_stream(
         block_context: 前端提取的完整段落上下文（优先使用）
         knowledge_base_id: 知识库 ID，用于检索隔离
         top_k: 向量检索的 chunk 数量（fallback 时使用）
+        session_id: 会话 ID（可选，传入则记录到会话，支持后续追问）
+        user_id: 用户 ID（用于会话归属校验）
 
     Yields:
         str: 逐 token 文本
@@ -142,7 +146,7 @@ async def explain_stream(
         if chunks:
             parts = []
             for i, chunk in enumerate(chunks):
-                chunk_headers = chunk["metadata"].get("headers", [])
+                chunk_headers = chunk["metadata"].get("headers", "")
                 header_str = " > ".join(chunk_headers) if chunk_headers else "文档片段"
                 parts.append(f"--- 资料片段 {i+1}（{header_str}）---\n{chunk['text']}")
             context_text = "\n\n".join(parts)
@@ -155,8 +159,30 @@ async def explain_stream(
     # 拼 prompt → 调用 LLM
     messages = _build_explain_prompt(selected_text, context_text, headers)
 
+    # 若提供会话，先记录用户问题，便于后续追问延续上下文
+    if session_id:
+        from app.services.session_manager import get_session_manager
+        mgr = get_session_manager()
+        mgr.add_user_message(
+            session_id,
+            f"请解释以下内容：{selected_text}",
+            file_path=file_path,
+            user_id=user_id,
+        )
+
+    full_response = ""
     async for token in stream_chat(messages):
+        full_response += token
         yield token
+
+    # 记录助手回复到会话
+    if session_id and full_response:
+        try:
+            from app.services.session_manager import get_session_manager
+            mgr = get_session_manager()
+            mgr.add_assistant_message(session_id, full_response, user_id=user_id)
+        except Exception as e:
+            logger.warning(f"[copilot] failed to save explain assistant message: {e}")
 
 
 async def chat_stream(
@@ -165,6 +191,7 @@ async def chat_stream(
     top_k: int = 3,
     session_id: Optional[str] = None,
     knowledge_base_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """
     自由对话（用户在 CopilotPanel 输入框中的提问）。
@@ -179,6 +206,7 @@ async def chat_stream(
         top_k: 检索的 chunk 数量
         session_id: 会话 ID（用于记忆管理）
         knowledge_base_id: 知识库 ID，用于检索隔离
+        user_id: 用户 ID（用于会话归属校验）
     """
     if not user_message or not user_message.strip():
         yield "请输入有效的问题。"
@@ -220,7 +248,7 @@ async def chat_stream(
     if session_id:
         from app.services.session_manager import get_session_manager
         mgr = get_session_manager()
-        session = mgr.get_session(session_id)
+        session = mgr.get_session(session_id, user_id=user_id)
         if session:
             # 将历史消息拼接到 system prompt 之后
             history = session.get_context_messages()
@@ -228,7 +256,7 @@ async def chat_stream(
             history = [m for m in history if m.get("role") != "system"]
             messages.extend(history)
             # 记录用户消息
-            mgr.add_user_message(session_id, user_message, file_path=file_path)
+            mgr.add_user_message(session_id, user_message, file_path=file_path, user_id=user_id)
 
     messages.append({"role": "user", "content": user_message})
 
@@ -243,6 +271,6 @@ async def chat_stream(
         try:
             from app.services.session_manager import get_session_manager
             mgr = get_session_manager()
-            mgr.add_assistant_message(session_id, full_response)
+            mgr.add_assistant_message(session_id, full_response, user_id=user_id)
         except Exception as e:
             logger.warning(f"[copilot] failed to save assistant message: {e}")
