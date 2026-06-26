@@ -16,6 +16,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.database import get_db, async_session_factory
+from app.dependencies import CurrentUser, get_current_user
 from app.models import TestSession, TestAnswer, Question, Diagnosis, KnowledgePoint, QuestionKnowledgeLink
 from app.services.evaluator import evaluate_answer as evaluate_single
 from app.services.evaluator import evaluate_code_answer
@@ -27,8 +28,6 @@ from app.services.llm import chat as llm_chat
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/test", tags=["test"])
-
-USER_ID = "default_user"  # 暂用默认用户，后续接入认证
 
 
 # ---- Models ----
@@ -211,7 +210,10 @@ async def _load_question_knowledge_links(session, question_ids: List[str]) -> di
 
 
 @router.post("/submit")
-async def submit_test(req: SubmitRequest) -> dict:
+async def submit_test(
+    req: SubmitRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> dict:
     """
     提交测试答案，返回完整学习闭环结果。
 
@@ -395,6 +397,7 @@ async def submit_test(req: SubmitRequest) -> dict:
             async with async_session_factory() as session:
                 # 6.1 创建测试会话
                 test_session = TestSession(
+                    user_id=current_user.user_id,
                     title=f"Test-{datetime.utcnow().strftime('%Y%m%d-%H%M')}",
                     mode=req.mode or "learn",
                     total_questions=len(eval_tasks),
@@ -479,7 +482,7 @@ async def submit_test(req: SubmitRequest) -> dict:
                     # 逐知识点应用掌握度变化（每道题单独计算，不是整场）
                     per_q_updates = await mastery_service.apply_mastery_delta(
                         db=session,
-                        user_id=USER_ID,
+                        user_id=current_user.user_id,
                         mastery_delta=mastery_delta,
                         is_correct=is_correct,
                         answer_id=str(answer_record.id),
@@ -523,7 +526,7 @@ async def submit_test(req: SubmitRequest) -> dict:
 
                         tasks = await mastery_service.create_review_tasks_from_diagnosis(
                             db=session,
-                            user_id=USER_ID,
+                            user_id=current_user.user_id,
                             diagnosis=diag,
                             diagnosis_id=diagnosis_id,
                             question_id=question_id,
@@ -534,7 +537,7 @@ async def submit_test(req: SubmitRequest) -> dict:
                 # 6.6 获取薄弱知识点
                 weak_points = await mastery_service.get_weak_points(
                     db=session,
-                    user_id=USER_ID,
+                    user_id=current_user.user_id,
                     limit=5,
                 )
 
@@ -579,12 +582,15 @@ async def submit_test(req: SubmitRequest) -> dict:
 
 
 @router.get("/sessions")
-async def list_sessions():
-    """获取测试会话列表"""
+async def list_sessions(current_user: CurrentUser = Depends(get_current_user)):
+    """获取当前用户的测试会话列表"""
     try:
         async with async_session_factory() as session:
             result = await session.execute(
-                select(TestSession).order_by(TestSession.started_at.desc()).limit(20)
+                select(TestSession)
+                .where(TestSession.user_id == current_user.user_id)
+                .order_by(TestSession.started_at.desc())
+                .limit(20)
             )
             sessions = result.scalars().all()
             return [
@@ -619,12 +625,15 @@ async def list_sessions():
 
 
 @router.get("/sessions/{session_id}")
-async def get_session(session_id: str):
+async def get_session(session_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """获取单个测试会话详情"""
     try:
         async with async_session_factory() as session:
             result = await session.execute(
-                select(TestSession).where(TestSession.id == session_id)
+                select(TestSession).where(
+                    TestSession.id == session_id,
+                    TestSession.user_id == current_user.user_id,
+                )
             )
             s = result.scalar_one_or_none()
             if s:

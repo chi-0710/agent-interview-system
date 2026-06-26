@@ -125,7 +125,7 @@ def ingest_docs(
     return result
 
 
-async def _write_to_db(chunks_data: list, db_session, knowledge_base_id: Optional[str] = None):
+async def _write_to_db(chunks_data: list, db_session, knowledge_base_id: Optional[str] = None, owner_id: Optional[str] = None):
     """异步写入 PostgreSQL：Document + DocumentChunk + ChunkKnowledgeLink"""
     from app.models import Document, DocumentChunk, ChunkKnowledgeLink, KnowledgePoint
     from sqlalchemy import select
@@ -172,6 +172,7 @@ async def _write_to_db(chunks_data: list, db_session, knowledge_base_id: Optiona
                 file_type="md",
                 file_path=vpath,
                 knowledge_base_id=knowledge_base_id,
+                owner_id=owner_id or "default_user",
             )
             db_session.add(doc)
             await db_session.flush()
@@ -321,6 +322,12 @@ async def ingest_knowledge_base(
     from app.models import KnowledgeBase, Document
     from sqlalchemy import select
 
+    kb_result = await db_session.execute(
+        select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
+    )
+    kb_row = kb_result.scalar_one_or_none()
+    kb_owner_id = kb_row.owner_id if kb_row else "default_user"
+
     result = {
         "total_files": len(file_infos),
         "total_chunks": 0,
@@ -381,7 +388,7 @@ async def ingest_knowledge_base(
         n_added = add_chunks(chunks_only)
         print(f"[ingestion] 知识库 {knowledge_base_id} 向量库写入 {n_added} 条记录")
 
-    await _write_to_db(all_chunks_data, db_session, knowledge_base_id=knowledge_base_id)
+    await _write_to_db(all_chunks_data, db_session, knowledge_base_id=knowledge_base_id, owner_id=kb_owner_id)
 
     kb_result = await db_session.execute(
         select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)

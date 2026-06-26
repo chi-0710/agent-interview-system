@@ -20,6 +20,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db, async_session_factory
+from app.dependencies import CurrentUser, get_current_user
 from app.models import KnowledgeBase, ImportJob, Document
 
 logger = logging.getLogger(__name__)
@@ -62,12 +63,14 @@ def _kb_to_response(kb: KnowledgeBase) -> dict:
 async def create_knowledge_base(
     req: CreateKnowledgeBaseRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """创建新知识库"""
     kb = KnowledgeBase(
         name=req.name,
         description=req.description,
         tags=req.tags or [],
+        owner_id=current_user.user_id,
         status="draft",
     )
     db.add(kb)
@@ -79,10 +82,13 @@ async def create_knowledge_base(
 @router.get("")
 async def list_knowledge_bases(
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
-    """列出所有知识库"""
+    """列出当前用户的知识库"""
     result = await db.execute(
-        select(KnowledgeBase).order_by(KnowledgeBase.created_at.desc())
+        select(KnowledgeBase)
+        .where(KnowledgeBase.owner_id == current_user.user_id)
+        .order_by(KnowledgeBase.created_at.desc())
     )
     kbs = result.scalars().all()
 

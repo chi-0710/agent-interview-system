@@ -11,17 +11,16 @@
 """
 import logging
 from typing import Optional, List
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Depends
 from pydantic import BaseModel
 
 from app.database import async_session_factory
+from app.dependencies import CurrentUser, get_current_user
 from app.services.learning import get_learning_service
 from app.services.mastery import get_mastery_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/learning", tags=["learning"])
-
-USER_ID = "default_user"  # 临时：默认用户
 
 
 # ---- 请求模型 ----
@@ -35,14 +34,17 @@ class NextSessionRequest(BaseModel):
 # ---- 路由 ----
 
 @router.post("/next-session")
-async def generate_next_session(req: NextSessionRequest):
+async def generate_next_session(
+    req: NextSessionRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
     """生成下一个自适应练习会话"""
     try:
         learning_service = get_learning_service()
         async with async_session_factory() as session:
             result = await learning_service.generate_next_session(
                 db=session,
-                user_id=USER_ID,
+                user_id=current_user.user_id,
                 mode=req.mode,
                 count=req.count,
                 kp_ids=req.kp_ids,
@@ -54,7 +56,10 @@ async def generate_next_session(req: NextSessionRequest):
 
 
 @router.get("/sessions")
-async def list_sessions(limit: int = 10):
+async def list_sessions(
+    limit: int = 10,
+    current_user: CurrentUser = Depends(get_current_user),
+):
     """获取练习会话列表"""
     try:
         from app.models import PracticeSession
@@ -63,7 +68,7 @@ async def list_sessions(limit: int = 10):
         async with async_session_factory() as session:
             result = await session.execute(
                 select(PracticeSession)
-                .where(PracticeSession.user_id == USER_ID)
+                .where(PracticeSession.user_id == current_user.user_id)
                 .order_by(PracticeSession.created_at.desc())
                 .limit(limit)
             )
@@ -89,7 +94,7 @@ async def list_sessions(limit: int = 10):
 
 
 @router.get("/plans")
-async def list_plans():
+async def list_plans(current_user: CurrentUser = Depends(get_current_user)):
     """获取学习计划列表"""
     try:
         from app.models import StudyPlan
@@ -98,7 +103,7 @@ async def list_plans():
         async with async_session_factory() as session:
             result = await session.execute(
                 select(StudyPlan)
-                .where(StudyPlan.user_id == USER_ID)
+                .where(StudyPlan.user_id == current_user.user_id)
                 .order_by(StudyPlan.created_at.desc())
             )
             plans = result.scalars().all()
@@ -133,6 +138,7 @@ async def create_plan():
 async def get_mastery_list(
     category: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """获取用户所有知识点的掌握情况"""
     try:
@@ -140,7 +146,7 @@ async def get_mastery_list(
         async with async_session_factory() as session:
             data = await mastery_service.get_user_mastery_list(
                 db=session,
-                user_id=USER_ID,
+                user_id=current_user.user_id,
                 category=category,
                 status=status,
             )
@@ -155,6 +161,7 @@ async def get_mastery_list(
 async def get_review_tasks(
     status: Optional[str] = Query(None),
     limit: int = Query(20),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """获取用户的复习任务列表"""
     try:
@@ -162,7 +169,7 @@ async def get_review_tasks(
         async with async_session_factory() as session:
             data = await mastery_service.get_review_tasks(
                 db=session,
-                user_id=USER_ID,
+                user_id=current_user.user_id,
                 status=status,
                 limit=limit,
             )
@@ -173,14 +180,17 @@ async def get_review_tasks(
 
 
 @router.get("/weak-points")
-async def get_weak_points(limit: int = Query(10)):
+async def get_weak_points(
+    limit: int = Query(10),
+    current_user: CurrentUser = Depends(get_current_user),
+):
     """获取用户最薄弱的知识点列表"""
     try:
         mastery_service = get_mastery_service()
         async with async_session_factory() as session:
             data = await mastery_service.get_weak_points(
                 db=session,
-                user_id=USER_ID,
+                user_id=current_user.user_id,
                 limit=limit,
             )
             await session.commit()
@@ -191,14 +201,17 @@ async def get_weak_points(limit: int = Query(10)):
 
 
 @router.post("/review-tasks/{task_id}/complete")
-async def complete_review_task(task_id: str):
+async def complete_review_task(
+    task_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
     """标记复习任务为已完成"""
     try:
         mastery_service = get_mastery_service()
         async with async_session_factory() as session:
             result = await mastery_service.complete_review_task(
                 db=session,
-                user_id=USER_ID,
+                user_id=current_user.user_id,
                 task_id=task_id,
             )
             if result is None:

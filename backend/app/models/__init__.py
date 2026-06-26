@@ -64,6 +64,7 @@ class Document(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     knowledge_base_id = Column(UUID(as_uuid=True), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=True, index=True)
+    owner_id = Column(String(100), nullable=False, default="default_user", index=True)
     title = Column(String(500), nullable=False)
     content = Column(Text, nullable=False)
     file_type = Column(String(50), nullable=False)  # pdf, docx, txt, md
@@ -272,6 +273,7 @@ class TestSession(Base):
     __tablename__ = "test_sessions"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(String(100), nullable=False, default="default_user", index=True)
     title = Column(String(500), nullable=False, default="Untitled Session")
     mode = Column(String(30), default="learn")  # learn, mock_interview
     total_questions = Column(Integer, default=0)
