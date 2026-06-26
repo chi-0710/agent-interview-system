@@ -39,15 +39,26 @@ function CreateKnowledgeBaseModal() {
     }
   };
 
+  const ALLOWED_EXTENSIONS = [
+    'md', 'markdown', 'txt',
+    'pdf',
+    'docx', 'doc',
+    'pptx', 'ppt',
+    'py', 'js', 'jsx', 'ts', 'tsx',
+    'java', 'go', 'c', 'h', 'cpp',
+    'cs', 'sql', 'json', 'yaml', 'yml',
+    'html', 'css', 'sh',
+  ];
+
   const handleFileChange = (e) => {
     const files = Array.from(e.target.files || []);
     const allowed = files.filter((f) => {
       const ext = f.name.split('.').pop()?.toLowerCase();
-      return ['md', 'txt', 'markdown'].includes(ext || '');
+      return ALLOWED_EXTENSIONS.includes(ext || '');
     });
     setSelectedFiles(allowed);
     if (allowed.length < files.length) {
-      setError('部分文件类型不支持（仅支持 .md / .txt）');
+      setError('部分文件类型不支持（支持 Markdown/TXT/PDF/Office/代码文件）');
     } else {
       setError('');
     }
@@ -202,7 +213,7 @@ function CreateKnowledgeBaseModal() {
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".md,.txt,.markdown"
+              accept=".md,.markdown,.txt,.pdf,.docx,.doc,.pptx,.ppt,.py,.js,.jsx,.ts,.tsx,.java,.go,.c,.h,.cpp,.cs,.sql,.json,.yaml,.yml,.html,.css,.sh"
               onChange={handleFileChange}
               className="hidden"
               disabled={isSubmitting}

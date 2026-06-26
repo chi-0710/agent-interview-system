@@ -96,7 +96,7 @@ def _run_subprocess_python(
         test_code_lines.append(f"    results.append({{")
         test_code_lines.append(f"        'name': {repr(test_name)},")
         test_code_lines.append(f"        'passed': _passed,")
-        test_code_lines.append(f"        'input': {repr(json.dumps(test_input, ensure_ascii=False)},")
+        test_code_lines.append(f"        'input': {repr(json.dumps(test_input, ensure_ascii=False))},")
         test_code_lines.append(f"        'expected': {repr(str(expected))},")
         test_code_lines.append(f"        'actual': repr(_actual) if _actual is not None else 'None',")
         test_code_lines.append(f"    }})")

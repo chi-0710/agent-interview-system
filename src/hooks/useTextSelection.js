@@ -91,7 +91,9 @@ export default function useTextSelection(containerRef) {
     [viewMode, setSelection, clearSelection, containerRef, extractBlockContext]
   );
 
-  const handleMouseDown = useCallback(() => {
+  const handleMouseDown = useCallback((e) => {
+    // 点击 AI 气泡（含其外层定位容器）时不清空选区，避免按钮被卸载导致 click 无法派发
+    if (e.target.closest('.ai-bubble')) return;
     clearSelection();
   }, [clearSelection]);
 
