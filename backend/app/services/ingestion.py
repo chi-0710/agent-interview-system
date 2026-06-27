@@ -31,10 +31,10 @@ def _scan_md_files(docs_dir: str) -> List[str]:
 
 
 def _abs_to_vpath(abs_path: str, docs_dir: str) -> str:
-    """将绝对路径转为虚拟路径，如 /docs/cs/os-memory.md"""
+    """将绝对路径转为 URI 标识，如 kb://default/cs/os-memory.md"""
     rel = os.path.relpath(abs_path, docs_dir)
     rel = rel.replace("\\", "/")
-    return f"/docs/{rel}"
+    return f"kb://default/{rel}"
 
 
 def _read_file(file_path: str) -> str:

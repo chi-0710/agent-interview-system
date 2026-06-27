@@ -10,7 +10,7 @@ from fastapi import UploadFile
 def get_upload_dir(knowledge_base_id: str) -> Path:
     """获取知识库上传文件存储目录"""
     from app.config import settings
-    base = Path(settings.uploads_dir) / knowledge_base_id
+    base = Path(settings.get_uploads_dir()) / knowledge_base_id
     base.mkdir(parents=True, exist_ok=True)
     return base
 

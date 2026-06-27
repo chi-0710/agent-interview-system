@@ -23,10 +23,19 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 # ---- 工具函数 ----
+def _parse_uri_path(uri: str) -> str:
+    """从 URI 标识中提取相对路径，如 kb://default/cs/os-memory.md → cs/os-memory.md"""
+    if uri.startswith("kb://"):
+        # kb://default/cs/os-memory.md → cs/os-memory.md
+        return uri.split("://", 1)[1].split("/", 1)[1]
+    # 兼容旧格式 /docs/cs/os-memory.md → cs/os-memory.md
+    return uri.lstrip("/").split("/", 1)[1] if "/" in uri.lstrip("/") else uri
+
+
 def _locate_markdown(path: str) -> str:
-    """将虚拟路径（如 /docs/cs/os-memory.md）解析为磁盘绝对路径。"""
+    """将 URI 标识解析为磁盘绝对路径（仅用于降级回退，实际文件已入库）。"""
     base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    rel_path = path.lstrip("/")
+    rel_path = _parse_uri_path(path)
     return os.path.join(base_dir, rel_path)
 
 # ---- 文件树配置 ----
@@ -85,18 +94,20 @@ def _build_file_tree(db_documents: list[Document]) -> list[dict]:
 
     # 填充文件
     for doc in db_documents:
-        vpath = doc.file_path  # 如 "/docs/cs/os-memory.md"
+        vpath = doc.file_path  # 如 "kb://default/cs/os-memory.md"
         if not vpath:
             continue
 
+        # 从 URI 提取相对路径: kb://default/cs/os-memory.md → cs/os-memory.md
+        rel_path = _parse_uri_path(vpath)
         # 从路径提取文件名（不含扩展名）
-        basename = os.path.splitext(os.path.basename(vpath))[0]  # "os-memory"
+        basename = os.path.splitext(os.path.basename(rel_path))[0]  # "os-memory"
         folder_key = FILE_TO_FOLDER.get(basename)
         if not folder_key:
             # 从路径推断文件夹
-            parts = vpath.replace("\\", "/").strip("/").split("/")
-            if len(parts) >= 3 and parts[0] == "docs":
-                folder_key = parts[1]  # "cs", "frontend", "ml"
+            parts = rel_path.replace("\\", "/").strip("/").split("/")
+            if len(parts) >= 2:
+                folder_key = parts[0]  # "cs", "frontend", "ml"
 
         if folder_key not in folders:
             folders[folder_key] = {
@@ -142,7 +153,7 @@ def _build_file_tree_from_fs(docs_dir: str) -> list[dict]:
     md_files = glob.glob(os.path.join(docs_dir, "**", "*.md"), recursive=True)
     for abs_path in sorted(md_files):
         rel = os.path.relpath(abs_path, docs_dir).replace("\\", "/")
-        vpath = f"/docs/{rel}"
+        vpath = f"kb://default/{rel}"
 
         basename = os.path.splitext(os.path.basename(rel))[0]
         folder_key = FILE_TO_FOLDER.get(basename)

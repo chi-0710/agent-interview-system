@@ -22,6 +22,28 @@ function normalizeTree(nodes) {
   }));
 }
 
+/**
+ * 从 URI 标识中提取相对路径
+ * kb://default/cs/os-memory.md → cs/os-memory.md
+ * /kb/{kb_id}/filename.md → filename.md (自定义知识库，无子目录)
+ * /docs/cs/os-memory.md → cs/os-memory.md (兼容旧格式)
+ */
+function extractRelPath(uri, knowledgeBaseId) {
+  if (!uri) return '';
+  // 自定义知识库格式: /kb/{kb_id}/filename.ext
+  if (uri.startsWith('/kb/')) {
+    const parts = uri.split('/').filter(Boolean);
+    // /kb/{kb_id}/filename.ext → 取最后一部分
+    return parts.length > 2 ? parts[parts.length - 1] : uri;
+  }
+  // 默认知识库格式: kb://default/cs/os-memory.md
+  if (uri.startsWith('kb://')) {
+    return uri.split('://')[1].split('/').slice(1).join('/');
+  }
+  // 兼容旧格式
+  return uri.replace(/^\/docs\//, '');
+}
+
 function FileTreeNode({ node, depth = 0 }) {
   const activeFile = useAppStore((s) => s.activeFile);
   const setActiveFile = useAppStore((s) => s.setActiveFile);
@@ -89,8 +111,11 @@ function KnowledgeBaseTreeItem({ kb, isActive, onClick, onDelete }) {
       onMouseEnter={() => setShowDelete(true)}
       onMouseLeave={() => setShowDelete(false)}
     >
-      <button
+      <div
+        role="button"
+        tabIndex={0}
         onClick={onClick}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onClick(); }}
         className={`flex items-center w-full px-3 py-2 text-sm transition-colors
           ${isActive
             ? 'bg-primary-50 dark:bg-primary-950 text-primary-700 dark:text-primary-300 border-r-2 border-primary-500'
@@ -120,7 +145,7 @@ function KnowledgeBaseTreeItem({ kb, isActive, onClick, onDelete }) {
             <Trash2 size={12} />
           </button>
         )}
-      </button>
+      </div>
     </div>
   );
 }
@@ -156,7 +181,9 @@ function KnowledgeBaseFileTree({ knowledgeBaseId }) {
           if (data && data.files && data.files.length > 0) {
             const folders = {};
             data.files.forEach((f) => {
-              const parts = (f.title || f.path || '').split(/[/\\]/).filter(Boolean);
+              // 从 URI 提取相对路径: kb://default/cs/os-memory.md → cs/os-memory.md
+              const relPath = extractRelPath(f.path || f.title || '', knowledgeBaseId);
+              const parts = relPath.split(/[/\\]/).filter(Boolean);
               let current = folders;
               let depth = 0;
               parts.forEach((part, i) => {

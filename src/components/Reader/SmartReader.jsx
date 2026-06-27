@@ -134,27 +134,63 @@ function createCustomRenderers(errorTags, currentHeaders) {
 
     // 标题 —— 跟踪当前 section 层级（同步到 store 供 AI 解释使用）
     h1({ children, ...props }) {
+      const id = String(children).toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]/g, '');
       currentHeaders.current = [String(children).toLowerCase()];
       useEffect(() => {
         useAppStore.getState().setCurrentHeaders(currentHeaders.current);
       });
-      return <h1 className="dark:text-surface-100 dark:border-surface-700" {...props}>{children}</h1>;
+      return <h1 id={id} className="dark:text-surface-100 dark:border-surface-700" {...props}>{children}</h1>;
     },
     h2({ children, ...props }) {
+      const id = String(children).toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]/g, '');
       const prev = currentHeaders.current || [];
       currentHeaders.current = [...prev.slice(0, 1), String(children).toLowerCase()];
       useEffect(() => {
         useAppStore.getState().setCurrentHeaders(currentHeaders.current);
       });
-      return <h2 className="dark:text-surface-100" {...props}>{children}</h2>;
+      return <h2 id={id} className="dark:text-surface-100" {...props}>{children}</h2>;
     },
     h3({ children, ...props }) {
+      const id = String(children).toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]/g, '');
       const prev = currentHeaders.current || [];
       currentHeaders.current = [...prev.slice(0, 2), String(children).toLowerCase()];
       useEffect(() => {
         useAppStore.getState().setCurrentHeaders(currentHeaders.current);
       });
-      return <h3 className="dark:text-surface-200" {...props}>{children}</h3>;
+      return <h3 id={id} className="dark:text-surface-200" {...props}>{children}</h3>;
+    },
+
+    // 链接 —— 锚点链接平滑滚动
+    a({ children, href, ...props }) {
+      if (href && href.startsWith('#')) {
+        return (
+          <a
+            href={href}
+            className="text-primary-600 dark:text-primary-400 hover:underline"
+            onClick={(e) => {
+              e.preventDefault();
+              const target = document.getElementById(href.slice(1));
+              if (target) {
+                target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              }
+            }}
+            {...props}
+          >
+            {children}
+          </a>
+        );
+      }
+      return (
+        <a
+          href={href}
+          className="text-primary-600 dark:text-primary-400 hover:underline"
+          target="_blank"
+          rel="noopener noreferrer"
+          {...props}
+        >
+          {children}
+        </a>
+      );
     },
 
     // 表格优化
@@ -249,6 +285,18 @@ export default function SmartReader() {
 
   const currentHeaders = useRef([]);
 
+  // 将 URI 路径转换为友好显示，如 kb://default/cs/os-memory.md → cs / os-memory
+  const friendlyPath = useMemo(() => {
+    if (!activeFile?.path) return '';
+    const p = activeFile.path;
+    if (p.startsWith('kb://')) {
+      const rel = p.split('://')[1].split('/').slice(1).join('/');
+      const parts = rel.replace('.md', '').split('/');
+      return parts.join(' / ');
+    }
+    return p;
+  }, [activeFile?.path]);
+
   const renderers = useMemo(
     () => createCustomRenderers(errorTags, currentHeaders),
     [errorTags]
@@ -266,7 +314,7 @@ export default function SmartReader() {
           {activeFile.title}
         </h1>
         <div className="flex items-center gap-3 text-sm text-surface-400 dark:text-surface-500">
-          <span>{activeFile.path}</span>
+          <span>{friendlyPath}</span>
           {errorTags.length > 0 && (
             <span className="flex items-center gap-1 text-red-500 dark:text-red-400">
               <span className="w-2 h-2 rounded-full bg-red-500" />
