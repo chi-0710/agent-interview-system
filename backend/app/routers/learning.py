@@ -1,13 +1,20 @@
 """学习规划与自适应出题路由
 
-- POST /api/learning/next-session     → 生成下一个练习会话
-- GET  /api/learning/sessions          → 练习会话列表
-- GET  /api/learning/plans             → 学习计划列表
-- POST /api/learning/plans             → 创建学习计划
-- GET  /api/learning/mastery           → 用户掌握度列表
-- GET  /api/learning/review-tasks      → 复习任务列表
-- GET  /api/learning/weak-points       → 薄弱知识点列表
-- POST /api/learning/review-tasks/{id}/complete → 完成复习任务
+- POST /api/learning/next-session                     → 生成下一个练习会话
+- GET  /api/learning/sessions                          → 练习会话列表
+- GET  /api/learning/plans                             → 学习计划列表
+- POST /api/learning/plans                             → 创建学习计划
+- GET  /api/learning/plans/{id}                        → 计划详情 + 进度
+- POST /api/learning/plans/{id}/next-session           → 为计划生成下一次练习
+- PUT  /api/learning/plans/{id}                        → 修改计划配置
+- POST /api/learning/plans/{id}/pause                  → 暂停计划
+- POST /api/learning/plans/{id}/resume                 → 恢复计划
+- POST /api/learning/plans/{id}/complete               → 完成/归档计划
+- DELETE /api/learning/plans/{id}                      → 删除计划
+- GET  /api/learning/mastery                           → 用户掌握度列表
+- GET  /api/learning/review-tasks                      → 复习任务列表
+- GET  /api/learning/weak-points                       → 薄弱知识点列表
+- POST /api/learning/review-tasks/{id}/complete        → 完成复习任务
 """
 import logging
 from typing import Optional, List
@@ -29,6 +36,23 @@ class NextSessionRequest(BaseModel):
     mode: str = "adaptive"  # adaptive | review | explore
     count: int = 5
     kp_ids: Optional[List[str]] = None
+
+
+class CreatePlanRequest(BaseModel):
+    name: str
+    objective: str
+    source_type: str  # knowledge_base | document
+    source_id: str
+    target_proficiency: str  # acquainted | familiar | proficient | expert
+    selected_kp_ids: Optional[List[str]] = None
+    schedule: Optional[dict] = None
+
+
+class UpdatePlanRequest(BaseModel):
+    name: Optional[str] = None
+    objective: Optional[str] = None
+    schedule: Optional[dict] = None
+    target_proficiency: Optional[str] = None
 
 
 # ---- 路由 ----
@@ -127,9 +151,313 @@ async def list_plans(current_user: CurrentUser = Depends(get_current_user)):
 
 
 @router.post("/plans")
-async def create_plan():
-    """创建学习计划（stub）"""
-    return {"message": "学习计划创建功能开发中，先使用 next-session 体验自适应出题"}
+async def create_plan(
+    req: CreatePlanRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """创建学习计划"""
+    try:
+        learning_service = get_learning_service()
+        async with async_session_factory() as session:
+            result = await learning_service.create_plan(
+                db=session,
+                user_id=current_user.user_id,
+                name=req.name,
+                objective=req.objective,
+                source_type=req.source_type,
+                source_id=req.source_id,
+                target_proficiency=req.target_proficiency,
+                selected_kp_ids=req.selected_kp_ids,
+                schedule=req.schedule,
+            )
+            await session.commit()
+            return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"[learning/plans/create] error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/plans/{plan_id}")
+async def get_plan(
+    plan_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """获取计划详情 + 进度"""
+    try:
+        from app.models import StudyPlan
+        from sqlalchemy import select
+
+        learning_service = get_learning_service()
+        async with async_session_factory() as session:
+            # 读取计划基本信息
+            plan_result = await session.execute(
+                select(StudyPlan).where(
+                    StudyPlan.id == plan_id,
+                    StudyPlan.user_id == current_user.user_id,
+                )
+            )
+            plan = plan_result.scalar_one_or_none()
+            if not plan:
+                raise HTTPException(status_code=404, detail="计划不存在")
+
+            # 获取进度
+            progress = await learning_service.get_plan_progress(
+                db=session,
+                plan_id=plan_id,
+                user_id=current_user.user_id,
+            )
+
+            return {
+                "id": str(plan.id),
+                "name": plan.name,
+                "objective": plan.objective,
+                "status": plan.status,
+                "config": plan.config,
+                "created_at": plan.created_at.isoformat(),
+                "started_at": plan.started_at.isoformat() if plan.started_at else None,
+                "completed_at": plan.completed_at.isoformat() if plan.completed_at else None,
+                "progress": progress,
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[learning/plans/{plan_id}] error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/plans/{plan_id}/next-session")
+async def generate_plan_session(
+    plan_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """为学习计划生成下一次练习"""
+    try:
+        learning_service = get_learning_service()
+        async with async_session_factory() as session:
+            result = await learning_service.generate_plan_session(
+                db=session,
+                plan_id=plan_id,
+                user_id=current_user.user_id,
+            )
+            await session.commit()
+            return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"[learning/plans/{plan_id}/next-session] error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/plans/{plan_id}")
+async def update_plan(
+    plan_id: str,
+    req: UpdatePlanRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """修改计划配置"""
+    try:
+        from app.models import StudyPlan
+        from sqlalchemy import select
+
+        async with async_session_factory() as session:
+            plan_result = await session.execute(
+                select(StudyPlan).where(
+                    StudyPlan.id == plan_id,
+                    StudyPlan.user_id == current_user.user_id,
+                )
+            )
+            plan = plan_result.scalar_one_or_none()
+            if not plan:
+                raise HTTPException(status_code=404, detail="计划不存在")
+
+            # 更新字段
+            if req.name is not None:
+                plan.name = req.name
+            if req.objective is not None:
+                plan.objective = req.objective
+            if req.schedule is not None:
+                config = plan.config or {}
+                config["schedule"] = req.schedule
+                plan.config = config
+            if req.target_proficiency is not None:
+                from app.services.learning import PROFICIENCY_LEVELS
+                if req.target_proficiency not in PROFICIENCY_LEVELS:
+                    raise HTTPException(status_code=400, detail=f"无效的目标熟练度等级: {req.target_proficiency}")
+                config = plan.config or {}
+                config["target_proficiency"] = req.target_proficiency
+                config["target_score_threshold"] = PROFICIENCY_LEVELS[req.target_proficiency]["score_threshold"]
+                plan.config = config
+
+            await session.commit()
+
+            return {
+                "id": str(plan.id),
+                "name": plan.name,
+                "objective": plan.objective,
+                "status": plan.status,
+                "config": plan.config,
+                "updated_at": plan.updated_at.isoformat(),
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[learning/plans/{plan_id}/update] error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/plans/{plan_id}/pause")
+async def pause_plan(
+    plan_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """暂停学习计划"""
+    try:
+        from app.models import StudyPlan
+        from sqlalchemy import select
+
+        async with async_session_factory() as session:
+            plan_result = await session.execute(
+                select(StudyPlan).where(
+                    StudyPlan.id == plan_id,
+                    StudyPlan.user_id == current_user.user_id,
+                )
+            )
+            plan = plan_result.scalar_one_or_none()
+            if not plan:
+                raise HTTPException(status_code=404, detail="计划不存在")
+
+            if plan.status != "active":
+                raise HTTPException(status_code=400, detail=f"计划状态为 {plan.status}，无法暂停")
+
+            plan.status = "paused"
+            await session.commit()
+
+            return {"id": str(plan.id), "status": "paused", "message": "计划已暂停"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[learning/plans/{plan_id}/pause] error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/plans/{plan_id}/resume")
+async def resume_plan(
+    plan_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """恢复学习计划"""
+    try:
+        from app.models import StudyPlan
+        from sqlalchemy import select
+
+        async with async_session_factory() as session:
+            plan_result = await session.execute(
+                select(StudyPlan).where(
+                    StudyPlan.id == plan_id,
+                    StudyPlan.user_id == current_user.user_id,
+                )
+            )
+            plan = plan_result.scalar_one_or_none()
+            if not plan:
+                raise HTTPException(status_code=404, detail="计划不存在")
+
+            if plan.status != "paused":
+                raise HTTPException(status_code=400, detail=f"计划状态为 {plan.status}，无法恢复")
+
+            plan.status = "active"
+            await session.commit()
+
+            return {"id": str(plan.id), "status": "active", "message": "计划已恢复"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[learning/plans/{plan_id}/resume] error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/plans/{plan_id}/complete")
+async def complete_plan(
+    plan_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """完成/归档学习计划"""
+    try:
+        from datetime import datetime
+        from app.models import StudyPlan
+        from sqlalchemy import select
+
+        async with async_session_factory() as session:
+            plan_result = await session.execute(
+                select(StudyPlan).where(
+                    StudyPlan.id == plan_id,
+                    StudyPlan.user_id == current_user.user_id,
+                )
+            )
+            plan = plan_result.scalar_one_or_none()
+            if not plan:
+                raise HTTPException(status_code=404, detail="计划不存在")
+
+            plan.status = "completed"
+            plan.completed_at = datetime.utcnow()
+            await session.commit()
+
+            # 获取最终进度
+            learning_service = get_learning_service()
+            async with async_session_factory() as session2:
+                progress = await learning_service.get_plan_progress(
+                    db=session2,
+                    plan_id=plan_id,
+                    user_id=current_user.user_id,
+                )
+
+            return {
+                "id": str(plan.id),
+                "status": "completed",
+                "completed_at": plan.completed_at.isoformat(),
+                "final_progress": progress,
+                "message": "计划已完成",
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[learning/plans/{plan_id}/complete] error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/plans/{plan_id}")
+async def delete_plan(
+    plan_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """删除学习计划"""
+    try:
+        from app.models import StudyPlan
+        from sqlalchemy import select, delete
+
+        async with async_session_factory() as session:
+            plan_result = await session.execute(
+                select(StudyPlan).where(
+                    StudyPlan.id == plan_id,
+                    StudyPlan.user_id == current_user.user_id,
+                )
+            )
+            plan = plan_result.scalar_one_or_none()
+            if not plan:
+                raise HTTPException(status_code=404, detail="计划不存在")
+
+            await session.execute(
+                delete(StudyPlan).where(StudyPlan.id == plan_id)
+            )
+            await session.commit()
+
+            return {"id": plan_id, "message": "计划已删除"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[learning/plans/{plan_id}/delete] error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---- 学习状态面板 ----

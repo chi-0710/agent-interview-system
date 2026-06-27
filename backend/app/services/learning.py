@@ -29,8 +29,17 @@ from app.models import (
     PracticeSession,
     PracticeSessionQuestion,
     MasteryEvent,
+    StudyPlan,
 )
 from app.services.mastery import get_mastery_service
+
+# 熟练度等级到内部分数的映射
+PROFICIENCY_LEVELS = {
+    "acquainted": {"label": "了解", "score_threshold": 35},
+    "familiar": {"label": "熟悉", "score_threshold": 55},
+    "proficient": {"label": "掌握", "score_threshold": 75},
+    "expert": {"label": "精通", "score_threshold": 90},
+}
 
 
 class LearningService:
@@ -421,6 +430,412 @@ class LearningService:
             return f"探索新知识点：{'、'.join(kp_names[:3])}"
 
         return f"推荐知识点：{'、'.join(kp_names[:3])}"
+
+    # ---------- 学习计划相关 ----------
+
+    async def create_plan(
+        self,
+        db: AsyncSession,
+        user_id: str,
+        name: str,
+        objective: str,
+        source_type: str,
+        source_id: str,
+        target_proficiency: str,
+        selected_kp_ids: List[str] = None,
+        schedule: dict = None,
+    ) -> dict:
+        """
+        创建学习计划。
+
+        Args:
+            db: 数据库会话
+            user_id: 用户 ID
+            name: 计划名称
+            objective: 学习目标描述
+            source_type: 来源类型 (knowledge_base | document)
+            source_id: 来源 ID
+            target_proficiency: 目标熟练度等级 (acquainted | familiar | proficient | expert)
+            selected_kp_ids: 用户勾选的知识点 ID 列表（可选，为空则自动提取）
+            schedule: 学习节奏配置
+
+        Returns:
+            创建的 StudyPlan 信息
+        """
+        if target_proficiency not in PROFICIENCY_LEVELS:
+            raise ValueError(f"无效的目标熟练度等级: {target_proficiency}")
+
+        now = datetime.utcnow()
+
+        # 1. 确定知识点范围
+        kp_ids = selected_kp_ids or []
+
+        # 如果用户未指定，从 source 中提取知识点
+        if not kp_ids:
+            kp_ids = await self._extract_kp_ids_from_source(
+                db=db,
+                source_type=source_type,
+                source_id=source_id,
+            )
+
+        if not kp_ids:
+            raise ValueError("未找到可学习的知识点，请确保知识库或文档中有内容")
+
+        # 2. 查询知识点详情
+        kp_result = await db.execute(
+            select(KnowledgePoint).where(KnowledgePoint.id.in_(kp_ids))
+        )
+        kps = kp_result.scalars().all()
+
+        kp_list = [
+            {
+                "kp_id": str(kp.id),
+                "name": kp.name,
+                "path": kp.path,
+            }
+            for kp in kps
+        ]
+
+        # 3. 估算完成时间
+        sessions_per_week = schedule.get("sessions_per_week", 5) if schedule else 5
+        questions_per_session = schedule.get("questions_per_session", 8) if schedule else 8
+        total_kps = len(kp_list)
+        # 假设每个知识点需要 2-3 次练习达到目标
+        estimated_sessions = total_kps * 2
+        estimated_weeks = estimated_sessions / max(sessions_per_week, 1)
+        target_end_date = now + timedelta(weeks=estimated_weeks)
+
+        # 4. 构建 config
+        config = {
+            "target_proficiency": target_proficiency,
+            "target_score_threshold": PROFICIENCY_LEVELS[target_proficiency]["score_threshold"],
+            "scope": {
+                "source_type": source_type,
+                "source_id": source_id,
+                "knowledge_points": kp_list,
+            },
+            "schedule": schedule or {
+                "sessions_per_week": sessions_per_week,
+                "questions_per_session": questions_per_session,
+            },
+            "timeframe": {
+                "start_date": now.strftime("%Y-%m-%d"),
+                "target_end_date": target_end_date.strftime("%Y-%m-%d"),
+                "estimated_weeks": round(estimated_weeks, 1),
+                "estimated_sessions": estimated_sessions,
+            },
+            "strategy": {
+                "review_ratio": 0.6,
+                "new_kp_ratio": 0.3,
+            },
+        }
+
+        # 5. 创建 StudyPlan
+        plan = StudyPlan(
+            user_id=user_id,
+            name=name,
+            objective=objective,
+            status="active",
+            config=config,
+            started_at=now,
+        )
+        db.add(plan)
+        await db.flush()
+
+        return {
+            "id": str(plan.id),
+            "name": plan.name,
+            "objective": plan.objective,
+            "status": plan.status,
+            "config": plan.config,
+            "created_at": plan.created_at.isoformat(),
+            "started_at": plan.started_at.isoformat(),
+            "kp_count": total_kps,
+            "estimated_sessions": estimated_sessions,
+            "estimated_weeks": round(estimated_weeks, 1),
+        }
+
+    async def _extract_kp_ids_from_source(
+        self,
+        db: AsyncSession,
+        source_type: str,
+        source_id: str,
+    ) -> List[str]:
+        """
+        从知识库或文档中提取知识点 ID。
+
+        策略：
+        1. 优先从现有 knowledge_points 表中按 category 或 knowledge_base_id 筛选
+        2. 如果没有，返回空列表（需要用户手动指定）
+        """
+        kp_ids = []
+
+        if source_type == "knowledge_base":
+            # 从知识库关联的知识点中提取
+            result = await db.execute(
+                select(KnowledgePoint.id).where(
+                    KnowledgePoint.knowledge_base_id == source_id
+                )
+            )
+            rows = result.all()
+            kp_ids = [str(row[0]) for row in rows]
+
+        elif source_type == "document":
+            # 从文档关联的知识点中提取（通过 chunks -> chunk_knowledge_links）
+            from app.models import DocumentChunk, ChunkKnowledgeLink
+            result = await db.execute(
+                select(ChunkKnowledgeLink.knowledge_point_id)
+                .join(DocumentChunk, DocumentChunk.id == ChunkKnowledgeLink.chunk_id)
+                .where(DocumentChunk.document_id == source_id)
+                .distinct()
+            )
+            rows = result.all()
+            kp_ids = [str(row[0]) for row in rows]
+
+        return kp_ids
+
+    async def get_plan_progress(
+        self,
+        db: AsyncSession,
+        plan_id: str,
+        user_id: str,
+    ) -> dict:
+        """
+        获取学习计划的进度（按等级维度统计）。
+
+        Returns:
+            进度数据，包含各等级分布、目标达成率等
+        """
+        # 1. 读取计划
+        plan_result = await db.execute(
+            select(StudyPlan).where(
+                StudyPlan.id == plan_id,
+                StudyPlan.user_id == user_id,
+            )
+        )
+        plan = plan_result.scalar_one_or_none()
+        if not plan:
+            return None
+
+        config = plan.config or {}
+        scope = config.get("scope", {})
+        kp_list = scope.get("knowledge_points", [])
+        target_proficiency = config.get("target_proficiency", "proficient")
+        target_score = PROFICIENCY_LEVELS.get(target_proficiency, {}).get("score_threshold", 75)
+
+        if not kp_list:
+            return {
+                "plan_id": str(plan.id),
+                "name": plan.name,
+                "status": plan.status,
+                "target_proficiency": target_proficiency,
+                "kp_distribution": {},
+                "target_reached_count": 0,
+                "total_kp_count": 0,
+                "progress_percent": 0,
+                "completed_sessions": 0,
+                "estimated_total_sessions": config.get("timeframe", {}).get("estimated_sessions", 0),
+                "current_streak_days": 0,
+                "weakest_kps": [],
+            }
+
+        kp_ids = [kp["kp_id"] for kp in kp_list]
+
+        # 2. 查询用户掌握度
+        mastery_result = await db.execute(
+            select(UserMastery).where(
+                UserMastery.user_id == user_id,
+                UserMastery.knowledge_point_id.in_(kp_ids),
+            )
+        )
+        masteries = mastery_result.scalars().all()
+        mastery_map = {str(m.knowledge_point_id): m for m in masteries}
+
+        # 3. 按等级分布统计
+        distribution = {
+            "unknown": 0,
+            "acquainted": 0,
+            "familiar": 0,
+            "proficient": 0,
+            "expert": 0,
+        }
+
+        target_reached = 0
+        weakest_kps = []
+
+        for kp_info in kp_list:
+            kp_id = kp_info["kp_id"]
+            mastery = mastery_map.get(kp_id)
+            score = mastery.mastery_score if mastery else 0.0
+
+            # 判断当前等级
+            if score >= 90:
+                current_level = "expert"
+            elif score >= 75:
+                current_level = "proficient"
+            elif score >= 55:
+                current_level = "familiar"
+            elif score >= 35:
+                current_level = "acquainted"
+            else:
+                current_level = "unknown"
+
+            distribution[current_level] += 1
+
+            # 是否达到目标
+            if score >= target_score:
+                target_reached += 1
+            else:
+                weakest_kps.append({
+                    "kp_id": kp_id,
+                    "name": kp_info.get("name", ""),
+                    "path": kp_info.get("path", ""),
+                    "current_score": round(score, 1),
+                    "target_score": target_score,
+                })
+
+        # 4. 统计练习会话数
+        session_result = await db.execute(
+            select(PracticeSession).where(
+                PracticeSession.plan_id == plan_id,
+                PracticeSession.user_id == user_id,
+                PracticeSession.status == "completed",
+            )
+        )
+        completed_sessions = len(session_result.scalars().all())
+
+        # 5. 计算连续学习天数（简化版：最近 7 天有练习就算连续）
+        now = datetime.utcnow()
+        recent_result = await db.execute(
+            select(PracticeSession.completed_at)
+            .where(
+                PracticeSession.plan_id == plan_id,
+                PracticeSession.user_id == user_id,
+                PracticeSession.status == "completed",
+                PracticeSession.completed_at >= now - timedelta(days=7),
+            )
+            .order_by(PracticeSession.completed_at.desc())
+        )
+        recent_completed = recent_result.scalars().all()
+        streak_days = self._calculate_streak_days(recent_completed)
+
+        # 6. 按分数排序薄弱知识点
+        weakest_kps.sort(key=lambda x: x["current_score"])
+        weakest_kps = weakest_kps[:5]  # 只返回最薄弱的 5 个
+
+        total_kps = len(kp_list)
+        progress_percent = round((target_reached / total_kps * 100) if total_kps > 0 else 0, 1)
+
+        return {
+            "plan_id": str(plan.id),
+            "name": plan.name,
+            "status": plan.status,
+            "target_proficiency": target_proficiency,
+            "kp_distribution": distribution,
+            "target_reached_count": target_reached,
+            "total_kp_count": total_kps,
+            "progress_percent": progress_percent,
+            "completed_sessions": completed_sessions,
+            "estimated_total_sessions": config.get("timeframe", {}).get("estimated_sessions", 0),
+            "current_streak_days": streak_days,
+            "weakest_kps": weakest_kps,
+        }
+
+    def _calculate_streak_days(self, completed_dates: List[datetime]) -> int:
+        """计算连续学习天数"""
+        if not completed_dates:
+            return 0
+
+        # 去重并按日期排序
+        unique_dates = sorted(set(d.date() for d in completed_dates), reverse=True)
+
+        streak = 1
+        today = datetime.utcnow().date()
+
+        # 检查是否从今天或昨天开始
+        if unique_dates[0] < today - timedelta(days=1):
+            return 0  # 断档超过 1 天
+
+        for i in range(1, len(unique_dates)):
+            if unique_dates[i] == unique_dates[i - 1] - timedelta(days=1):
+                streak += 1
+            else:
+                break
+
+        return streak
+
+    async def generate_plan_session(
+        self,
+        db: AsyncSession,
+        plan_id: str,
+        user_id: str,
+    ) -> dict:
+        """
+        为学习计划生成下一次练习。
+
+        复用 generate_next_session，但限定在计划范围内的知识点。
+        """
+        # 1. 读取计划配置
+        plan_result = await db.execute(
+            select(StudyPlan).where(
+                StudyPlan.id == plan_id,
+                StudyPlan.user_id == user_id,
+            )
+        )
+        plan = plan_result.scalar_one_or_none()
+        if not plan:
+            raise ValueError("计划不存在")
+
+        if plan.status != "active":
+            raise ValueError(f"计划状态为 {plan.status}，无法生成练习")
+
+        config = plan.config or {}
+        scope = config.get("scope", {})
+        kp_list = scope.get("knowledge_points", [])
+        kp_ids = [kp["kp_id"] for kp in kp_list]
+
+        questions_per_session = config.get("schedule", {}).get("questions_per_session", 8)
+
+        # 2. 决定模式（根据计划进度动态选择）
+        mode = self._determine_session_mode(db, plan_id, user_id, kp_ids)
+
+        # 3. 调用现有的 generate_next_session
+        result = await self.generate_next_session(
+            db=db,
+            user_id=user_id,
+            mode=mode,
+            count=questions_per_session,
+            kp_ids=kp_ids,
+        )
+
+        # 4. 关联到计划
+        if result.get("session_id"):
+            from sqlalchemy import update
+            await db.execute(
+                update(PracticeSession)
+                .where(PracticeSession.id == result["session_id"])
+                .values(plan_id=plan.id)
+            )
+            await db.commit()
+
+        return result
+
+    def _determine_session_mode(
+        self,
+        db: AsyncSession,
+        plan_id: str,
+        user_id: str,
+        kp_ids: List[str],
+    ) -> str:
+        """
+        根据计划进度决定本次练习模式。
+
+        策略：
+        - 如果有大量复习到期的知识点 → review
+        - 否则 → adaptive
+        """
+        # 简化版：默认 adaptive，后续可根据掌握度数据优化
+        return "adaptive"
 
 
 # ============== 全局单例 ==============
