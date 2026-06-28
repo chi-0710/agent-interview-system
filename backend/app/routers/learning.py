@@ -36,6 +36,7 @@ class NextSessionRequest(BaseModel):
     mode: str = "adaptive"  # adaptive | review | explore
     count: int = 5
     kp_ids: Optional[List[str]] = None
+    file_path: Optional[str] = None  # 按文档限定出题范围
 
 
 class CreatePlanRequest(BaseModel):
@@ -66,6 +67,71 @@ async def generate_next_session(
     try:
         learning_service = get_learning_service()
         async with async_session_factory() as session:
+            # 如果传了 file_path，直接按文档查题目，保证文档与题目一一对应
+            if req.file_path:
+                from app.models import Document, Question
+                from sqlalchemy import select
+
+                doc_result = await session.execute(
+                    select(Document.id).where(Document.file_path == req.file_path)
+                )
+                doc_id = doc_result.scalar_one_or_none()
+                if doc_id:
+                    q_result = await session.execute(
+                        select(Question)
+                        .where(Question.document_id == doc_id)
+                        .order_by(Question.difficulty.asc())
+                        .limit(req.count)
+                    )
+                    questions = q_result.scalars().all()
+
+                    if not questions:
+                        return {
+                            "session_id": None,
+                            "questions": [],
+                            "mode": req.mode,
+                            "reason_summary": "该文档暂无题目",
+                        }
+
+                    # 创建练习会话
+                    from datetime import datetime
+                    from app.models import PracticeSession, PracticeSessionQuestion
+                    ps = PracticeSession(
+                        user_id=current_user.user_id,
+                        mode=req.mode,
+                        question_count=len(questions),
+                        status="in_progress",
+                        started_at=datetime.utcnow(),
+                    )
+                    session.add(ps)
+                    await session.flush()
+
+                    for i, q in enumerate(questions):
+                        psq = PracticeSessionQuestion(
+                            session_id=ps.id,
+                            question_id=q.id,
+                            order_index=i,
+                        )
+                        session.add(psq)
+                    await session.commit()
+
+                    return {
+                        "session_id": str(ps.id),
+                        "questions": [
+                            {
+                                "id": str(q.id),
+                                "content": q.content,
+                                "type": q.type,
+                                "options": q.options,
+                                "difficulty": q.difficulty,
+                            }
+                            for q in questions
+                        ],
+                        "mode": req.mode,
+                        "reason_summary": f"按文档出题：{req.file_path}",
+                    }
+
+            # 未传 file_path，走自适应出题
             result = await learning_service.generate_next_session(
                 db=session,
                 user_id=current_user.user_id,

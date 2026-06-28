@@ -8,3 +8,8 @@ npm-debug.log
 .env.*.local
 dist
 .DS_Store
+.conda-env
+.venv
+__pycache__
+*.pyc
+.trae

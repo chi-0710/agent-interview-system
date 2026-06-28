@@ -3,17 +3,21 @@
 提供 SSE 流式接口：
 - POST /api/copilot/explain  → 划线伴读解释
 - POST /api/copilot/chat     → 自由对话（保留兼容，复用同一个模式）
+- POST /api/copilot/generate-questions  → AI 生成题目
+- POST /api/copilot/evaluate-answer     → AI 评估回答（自动选择评估策略）
 """
 import json
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Request, Depends
+from fastapi import APIRouter, Request, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
 from app.dependencies import CurrentUser, get_current_user
 from app.services.copilot import explain_stream, chat_stream
+from app.database import async_session_factory
+from app.services.question_generator import get_question_generator
 
 logger = logging.getLogger(__name__)
 
@@ -268,27 +272,109 @@ async def clear_session(session_id: str, current_user: CurrentUser = Depends(get
     return {"cleared": ok}
 
 
-# ---- 保留旧 stub（兼容） ----
+# ---- AI 出题与评估 ----
+
+class GenerateQuestionsRequest(BaseModel):
+    source_type: str              # knowledge_point | document | knowledge_base
+    source_id: str
+    question_type: str = "single" # single | text | code
+    difficulty: str = "medium"
+    count: int = 5
+
+
+class EvaluateAnswerRequest(BaseModel):
+    question_id: str
+    user_answer: str
+
 
 @router.post("/generate-questions")
-async def generate_questions():
-    """AI 生成题目（stub）"""
-    return {
-        "questions": [
-            {
-                "content": "[待 LLM 接入] 请简述你对 AI Agent 的理解",
-                "difficulty": "medium",
-                "category": "AI/LLM",
-            }
-        ],
-        "message": "此接口将在后续接入 LLM 后可用",
-    }
+async def generate_questions(
+    req: GenerateQuestionsRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """AI 生成题目并写入数据库"""
+    try:
+        generator = get_question_generator()
+        async with async_session_factory() as session:
+            result = await generator.generate_questions(
+                db=session,
+                user_id=current_user.user_id,
+                source_type=req.source_type,
+                source_id=req.source_id,
+                question_type=req.question_type,
+                difficulty=req.difficulty,
+                count=req.count,
+            )
+            await session.commit()
+            return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"[copilot/generate-questions] error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/evaluate-answer")
-async def evaluate_answer():
-    """AI 评估回答（stub）"""
-    return {
-        "score": 0.0,
-        "feedback": "此接口将在后续接入 LLM 后可用",
-    }
+async def evaluate_answer(
+    req: EvaluateAnswerRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    统一评估接口，根据题型自动选择评估策略。
+
+    - 选择题 → 规则判断（0 token）
+    - 简答题 → LLM 评判
+    - 代码题 → 沙盒执行 + LLM 错因
+    """
+    try:
+        from app.models import Question
+        from sqlalchemy import select
+        from app.services.evaluator import evaluate_answer as llm_evaluate_answer, evaluate_code_answer
+
+        generator = get_question_generator()
+
+        async with async_session_factory() as session:
+            # 1. 加载题目
+            q_result = await session.execute(
+                select(Question).where(Question.id == req.question_id)
+            )
+            question = q_result.scalar_one_or_none()
+            if not question:
+                raise HTTPException(status_code=404, detail="题目不存在")
+
+            # 2. 根据题型选择评估策略
+            if question.type == "single":
+                # 选择题：纯规则评估（0 token）
+                question_dict = {
+                    "content": question.content,
+                    "options": question.options,
+                    "correct_option": question.correct_option,
+                    "explanation": question.expected_answer,
+                    "option_explanations": question.option_explanations or [],
+                    "tags": question.tags or [],
+                }
+                result = generator.evaluate_single_choice(question_dict, req.user_answer)
+
+            elif question.type == "code":
+                # 代码题：沙盒执行 + LLM 错因
+                result = await evaluate_code_answer(
+                    question_id=req.question_id,
+                    user_answer=req.user_answer,
+                )
+
+            else:
+                # 简答题：LLM 评判
+                result = await llm_evaluate_answer(
+                    question_id=req.question_id,
+                    user_answer=req.user_answer,
+                )
+
+            return result
+
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"[copilot/evaluate-answer] error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

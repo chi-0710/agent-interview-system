@@ -241,6 +241,8 @@ class Question(Base):
     category = Column(String(100), nullable=True)
     type = Column(String(20), default="text")  # single, text, code
     options = Column(JSON, nullable=True)       # 单选题选项数组
+    correct_option = Column(Integer, nullable=True)  # 选择题正确答案索引 (0=A, 1=B, 2=C, 3=D)
+    option_explanations = Column(JSON, nullable=True)  # 每个选项的解释数组
     tags = Column(JSON, nullable=True)          # 知识点标签数组（兼容旧逻辑）
     sections = Column(JSON, nullable=True)      # 对应的文档 header 路径（兼容旧逻辑）
     rubric = Column(JSON, nullable=True)        # 评分标准（结构化）

@@ -43,11 +43,11 @@ export default function TestMode() {
     setFeedback(null);
     setPracticeSessionId(null);
 
-    // 1. 尝试自适应出题（学习闭环主路径）
+    // 1. 尝试自适应出题（学习闭环主路径），按当前文档限定出题范围
     fetch('/api/learning/next-session', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: 'adaptive', count: 5 }),
+      body: JSON.stringify({ mode: 'adaptive', count: 5, file_path: activeFile.path }),
     })
       .then((r) => r.ok ? r.json() : null)
       .then(async (data) => {

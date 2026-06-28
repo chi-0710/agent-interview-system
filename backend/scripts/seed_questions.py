@@ -194,7 +194,7 @@ SEED_KNOWLEDGE_RELATIONS = [
 SEED_QUESTIONS = [
     # ---- os-memory.md ----
     {
-        "file_path": "/docs/cs/os-memory.md",
+        "file_path": "kb://default/cs/os-memory.md",
         "questions": [
             {
                 "id": "550e8400-e29b-41d4-a716-446655440001",
@@ -309,7 +309,7 @@ SEED_QUESTIONS = [
     },
     # ---- react-fiber.md ----
     {
-        "file_path": "/docs/frontend/react-fiber.md",
+        "file_path": "kb://default/frontend/react-fiber.md",
         "questions": [
             {
                 "id": "550e8400-e29b-41d4-a716-446655440004",
@@ -489,8 +489,8 @@ async def seed_questions_and_links(session):
         if not doc:
             title = os.path.basename(file_path).replace(".md", "")
             title_map = {
-                "/docs/cs/os-memory.md": "操作系统内存管理",
-                "/docs/frontend/react-fiber.md": "React Fiber 架构深度解析",
+                "kb://default/cs/os-memory.md": "操作系统内存管理",
+                "kb://default/frontend/react-fiber.md": "React Fiber 架构深度解析",
             }
             title = title_map.get(file_path, title)
 
