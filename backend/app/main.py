@@ -8,7 +8,7 @@ from sqlalchemy import select, update
 from app.config import get_settings
 from app.database import async_session_factory
 from app.models import ImportJob, KnowledgeBase
-from app.routers import documents, questions, test, copilot, learning, knowledge_bases
+from app.routers import documents, questions, test, copilot, learning, knowledge_bases, demo
 
 settings = get_settings()
 
@@ -82,6 +82,7 @@ app.add_middleware(
 app.include_router(documents.router)
 app.include_router(questions.router)
 app.include_router(test.router)
+app.include_router(demo.router)
 app.include_router(copilot.router)
 app.include_router(learning.router)
 app.include_router(knowledge_bases.router)

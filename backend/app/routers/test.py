@@ -2,18 +2,23 @@
 
 学习闭环核心路由：提交答案 → 评判 → 诊断 → 更新掌握度 → 生成复习任务 → 返回反馈
 
-- POST /api/test/submit  → 提交答案，返回完整学习闭环结果
-- GET  /api/test/sessions → 测试会话列表
+- POST /api/test/submit              → 提交答案，返回完整学习闭环结果（四态提交协议）
+- GET  /api/test/submissions/{id}    → 查询提交状态（用于 outcome_unknown 恢复与对账）
+- GET  /api/test/sessions            → 测试会话列表
 """
 import asyncio
+import hashlib
+import json
 import logging
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Literal, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError, OperationalError, InterfaceError
 
 from app.database import get_db, async_session_factory
 from app.dependencies import CurrentUser, get_current_user
@@ -30,7 +35,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/test", tags=["test"])
 
 
-# ---- Models ----
+# ---- Pydantic Models ----
 
 class AnswerItem(BaseModel):
     question_id: str
@@ -52,6 +57,7 @@ class SubmitRequest(BaseModel):
     file_path: Optional[str] = None
     session_id: Optional[str] = None  # 可选：属于某个练习会话
     mode: Optional[str] = "learn"  # learn | mock_interview
+    submission_id: Optional[str] = None  # M4: 幂等键，前端生成
 
     @field_validator("answers")
     @classmethod
@@ -74,107 +80,66 @@ class DetailItem(BaseModel):
     explanation: str = ""
 
 
-class SubmitResponse(BaseModel):
+class EvaluationResult(BaseModel):
     score: float
     summary: str
     details: List[DetailItem]
     errorTags: List[ErrorTag]
 
 
-# ---- Routes ----
-
-IN_MEMORY_QUESTIONS = {
-    # os-memory.md
-    "q-os-1": {"id": "q-os-1", "type": "single", "content": "以下哪种页面置换算法不会出现 Belady 异常？",
-               "expected_answer": "LRU。LRU 和 OPT（最优置换）都属于栈算法（Stack Algorithm），满足包含属性，增加物理页框数不会导致缺页异常增加。FIFO 是典型会出现 Belady 异常的算法。",
-               "options": ["FIFO", "LRU", "Clock", "OPT"], "tags": ["页面置换", "Belady异常"],
-               "sections": ["操作系统内存管理", "页面置换算法"], "difficulty": "medium", "category": "页面置换算法"},
-    "q-os-2": {"id": "q-os-2", "type": "text", "content": "TLB 的作用是什么？它与 CPU Cache 的区别在哪里？",
-               "expected_answer": "TLB（Translation Lookaside Buffer）是 MMU 内部的高速缓存，用于加速虚拟地址到物理地址的翻译，避免每次地址翻译都需要访问多级页表。它缓存的是 VPN→PFN 的映射关系。而 CPU Cache 缓存的是指令和数据的实际内容。两者在层次结构上互补：TLB 命中后，CPU 才能知道物理地址去访问 Cache。",
-               "tags": ["TLB", "虚拟内存", "MMU"], "sections": ["操作系统内存管理", "TLB 与缓存"],
-               "difficulty": "medium", "category": "TLB 与缓存"},
-    "q-os-3": {"id": "q-os-3", "type": "code", "content": "补全 Clock 算法的核心逻辑：当指针扫过一个访问位为 1 的页面时，应当如何处理？",
-               "expected_answer": "将该页面的访问位 ref_bit 清零，指针前移。Clock 算法通过'给第二次机会'的方式近似 LRU：被访问过的页面暂时保留，遇到 ref_bit=0 的页面才替换出去。",
-               "tags": ["页面置换", "Clock算法"], "sections": ["操作系统内存管理", "页面置换算法"],
-               "difficulty": "hard", "category": "页面置换算法"},
-    # react-fiber.md
-    "q-react-1": {"id": "q-react-1", "type": "single", "content": "React Fiber 架构中，两棵 Fiber 树通过哪个字段互相引用，实现无缝切换？",
-                  "expected_answer": "alternate。alternate 指针在 Current Tree 和 Work-in-Progress Tree 之间建立双向引用，提交更新时两棵树角色互换。",
-                  "options": ["return", "sibling", "alternate", "child"], "tags": ["Fiber", "双缓冲"],
-                  "sections": ["react fiber 架构深度解析", "双缓冲机制"], "difficulty": "medium", "category": "Fiber 节点结构"},
-    "q-react-2": {"id": "q-react-2", "type": "text", "content": "为什么 React 要从 Stack Reconciler 迁移到 Fiber Reconciler？解决了什么问题？",
-                  "expected_answer": "Stack Reconciler 是同步递归的，一旦开始就无法中断，导致大型应用渲染时主线程被长时间阻塞，表现为掉帧和输入延迟。Fiber Reconciler 将渲染切分为可中断的小单元（Fiber 节点），通过协作式调度在浏览器空闲时间内完成，从而保证帧率稳定。核心收益：可中断渲染、优先级调度、时间切片。",
-                  "tags": ["Fiber", "调度"], "sections": ["react fiber 架构深度解析", "调度优先级"],
-                  "difficulty": "hard", "category": "调度优先级"},
-    # fallback
-    "q-fallback-1": {"id": "q-fallback-1", "type": "text", "content": "请用你自己的话简述当前文档的核心思想。",
-                     "expected_answer": "核心思想是将复杂系统拆解为可管理的子模块，通过清晰的数据结构和调度算法保证性能与可维护性。",
-                     "tags": ["概念理解"], "sections": [], "difficulty": "easy", "category": "概念理解"},
-}
+class LearningRecord(BaseModel):
+    sessionId: Optional[str] = None
+    diagnoses: List[dict] = []
+    masteryUpdates: dict = {}
+    reviewTasks: List[dict] = []
+    weakPoints: List[dict] = []
 
 
-def _score_by_rules(question: dict, user_answer: str) -> dict:
-    """规则判题：在没有 LLM 时使用关键词匹配打分。"""
-    expected = (question.get("expected_answer") or "").lower()
-    user = (user_answer or "").lower().strip()
-    q_type = question.get("type", "text")
+class SubmitResponse(BaseModel):
+    submissionId: str
+    commitStatus: Literal["committed", "not_committed", "outcome_unknown", "tracking_disabled"]
+    retryable: bool = False
+    message: Optional[str] = None
+    evaluation: EvaluationResult
+    learningRecord: Optional[LearningRecord] = None
 
-    correct = False
-    score = 0
-    explanation = ""
-    error_tags = []
 
-    if not user:
-        return {"correct": False, "score": 0, "error_type": "未作答",
-                "explanation": "用户未提供答案。", "error_tags": question.get("tags", [])}
+# ---- 自定义异常 ----
 
-    # 单选题：匹配 options 中的正确答案关键词
-    if q_type == "single":
-        # 提取预期答案第一句话做关键词
-        first_word = user.split()[0] if user.split() else user
-        # 检查用户是否选择了正确选项的关键词
-        expected_tokens = expected.split("。")[0].lower()
-        if first_word in expected_tokens or any(tok in user for tok in expected_tokens.split()[:3]):
-            correct = True
-            score = 95
-            explanation = "选项正确，关键词匹配到位。"
-        else:
-            score = 30
-            error_tags = question.get("tags", [])
-            explanation = f"答错了。要点：{expected.split('。')[0]}。"
+class CommitUnknownError(Exception):
+    """commit 阶段连接异常，无法确认 DB 是否已提交。"""
 
-    # 简答题：关键词覆盖度
-    elif q_type in ("text", "code"):
-        keywords = []
-        for tag in question.get("tags", []):
-            keywords.append(tag.lower())
-        # 从 expected 提取一些中文关键词（2-4 字片段）
-        import re
-        for m in re.findall(r"[\u4e00-\u9fa5A-Za-z0-9]+", expected):
-            if len(m) >= 2:
-                keywords.append(m.lower())
-        keywords = list(dict.fromkeys(keywords))[:10]
 
-        hit = sum(1 for kw in keywords if kw and kw in user)
-        coverage = hit / max(len(keywords), 1)
+class RetryablePersistenceError(Exception):
+    """事务内异常，已回滚，确定未提交。"""
 
-        if coverage >= 0.45:
-            correct = True
-            score = min(100, int(50 + coverage * 60))
-            explanation = f"答对了 {coverage*100:.0f}% 的要点（命中 {hit}/{len(keywords)} 个关键词）。"
-        else:
-            score = int(coverage * 80)
-            error_tags = question.get("tags", [])
-            explanation = f"只命中了 {hit}/{len(keywords)} 个关键概念，建议回到对应章节复习。"
 
-    return {
-        "correct": correct,
-        "score": score,
-        "error_type": (None if correct else "概念混淆"),
-        "explanation": explanation,
-        "error_tags": ([] if correct else error_tags),
+class ConcurrentSubmissionError(Exception):
+    """并发重复提交，IntegrityError 触发，需回查。"""
+
+
+# ---- 幂等哈希 (M4.2) ----
+
+def compute_request_hash(req: SubmitRequest) -> str:
+    """计算请求哈希，用于幂等冲突检测。
+    包含：answers（按 question_id 排序） + practice_session_id + mode
+    不包含：submission_id（幂等键本身）、file_path（派生字段）、session_id（向后兼容字段）
+    """
+    sorted_answers = sorted(
+        [{"question_id": a.question_id, "user_answer": a.user_answer} for a in req.answers],
+        key=lambda x: x["question_id"],
+    )
+    canonical = {
+        "answers": sorted_answers,
+        "practice_session_id": req.practice_session_id,
+        "mode": req.mode,
     }
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
 
+
+# ---- 辅助函数 ----
 
 async def _load_question_knowledge_links(session, question_ids: List[str]) -> dict:
     """加载题目关联的知识点信息"""
@@ -205,41 +170,28 @@ async def _load_question_knowledge_links(session, question_ids: List[str]) -> di
         return {}
 
 
-@router.post("/submit")
-async def submit_test(
+# ---- M3.1 拆分函数 1：加载题目 + 严格校验 ----
+
+async def load_submission_questions(
     req: SubmitRequest,
-    current_user: CurrentUser = Depends(get_current_user),
-) -> dict:
+    current_user: CurrentUser,
+) -> Tuple[dict, Optional[PracticeSession], Optional[str]]:
+    """加载题目并严格校验。
+
+    - 校验 practice_session_id 归属、反查 file_path
+    - 严格校验题目（重复 qid→422、不存在→404、归属不符→422）
+    - DB 不可用→503
+
+    返回：(questions_map, practice_session_obj, derived_file_path)
+    不再有 IN_MEMORY_QUESTIONS 兜底。
     """
-    提交测试答案，返回完整学习闭环结果。
-
-    处理流程：
-    1. 加载题目（DB 优先，内置题库兜底）
-    2. 并发评判答案（LLM 优先，规则判分兜底）
-    3. 能力诊断：错误分类、薄弱知识点定位
-    4. 更新用户掌握度（五状态模型）
-    5. 生成复习任务
-    6. 持久化所有数据（DB 可用时）
-    7. 返回完整反馈
-
-    返回字段（向后兼容 + 新增）：
-    - score / summary / details / errorTags（原有）
-    - diagnoses: 每道题的结构化诊断
-    - mastery_updates: 掌握度变化
-    - review_tasks: 生成的复习任务
-    - weak_points: 薄弱知识点总结
-    """
-    diagnosis_service = get_diagnosis_service()
-    mastery_service = get_mastery_service()
-
-    # ========== Step 0: 处理练习会话（practice_session_id） ==========
-    # 约束：测试接口应以 practice_session_id + answers 作为输入，而非 file_path。
-    # 当提供 practice_session_id 时：校验归属、从会话题目反查 file_path 用于错题解析。
     derived_file_path = req.file_path
     practice_session_obj = None
+
+    # Step 0: 处理练习会话（practice_session_id）
     if req.practice_session_id:
-        try:
-            async with async_session_factory() as session:
+        async with async_session_factory() as session:
+            try:
                 ps_result = await session.execute(
                     select(PracticeSession).where(
                         PracticeSession.id == req.practice_session_id,
@@ -262,102 +214,149 @@ async def submit_test(
                     row = doc_result.first()
                     if row and row[0]:
                         derived_file_path = row[0]
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.warning(f"[test/submit] 加载练习会话失败: {e}")
+            except HTTPException:
+                raise
+            except (OperationalError, InterfaceError) as e:
+                logger.error(f"[test/submit] DB 不可用（加载练习会话）: {e}", exc_info=True)
+                raise HTTPException(status_code=503, detail="数据库不可用，请稍后重试")
+            except Exception as e:
+                logger.warning(f"[test/submit] 加载练习会话失败: {e}")
 
-    # ========== Step 1: 加载题目 ==========
-    questions = None
-    used_db = False
-    try:
-        async with async_session_factory() as session:
-            q_ids = [a.question_id for a in req.answers]
+    # Step 1: 加载题目 + 严格校验（不再有 IN_MEMORY_QUESTIONS 兜底）
+    q_ids = [a.question_id for a in req.answers]
+    if len(q_ids) != len(set(q_ids)):
+        raise HTTPException(status_code=422, detail="存在重复的 question_id")
+
+    questions: dict = {}
+    async with async_session_factory() as session:
+        try:
             result = await session.execute(
                 select(Question).where(Question.id.in_(q_ids))
             )
             db_qs = result.scalars().all()
-            if db_qs:
-                questions = {str(q.id): {
+            for q in db_qs:
+                questions[str(q.id)] = {
                     "id": str(q.id), "type": q.type or "text", "content": q.content,
                     "expected_answer": q.expected_answer or "", "options": q.options,
                     "tags": q.tags or [], "sections": q.sections or [],
                     "difficulty": q.difficulty or "medium",
                     "common_mistakes": q.common_mistakes,
                     "rubric": q.rubric,
-                } for q in db_qs}
-                used_db = True
-    except Exception as e:
-        logger.warning(f"[test/submit] DB 不可用，降级到内置题库: {e}")
+                }
+        except (OperationalError, InterfaceError) as e:
+            logger.error(f"[test/submit] DB 不可用（加载题目）: {e}", exc_info=True)
+            raise HTTPException(status_code=503, detail="数据库不可用，请稍后重试")
 
-    if not questions:
-        questions = {qid: IN_MEMORY_QUESTIONS.get(qid) for qid in
-                     [a.question_id for a in req.answers]}
-        questions = {k: v for k, v in questions.items() if v}
+    if len(questions) != len(q_ids):
+        missing = set(q_ids) - set(questions.keys())
+        raise HTTPException(status_code=404, detail=f"题目不存在: {missing}")
 
-    if not questions:
-        raise HTTPException(status_code=404, detail="未找到对应题目")
+    # 校验归属
+    if practice_session_obj is not None:
+        async with async_session_factory() as session:
+            try:
+                ps_q_result = await session.execute(
+                    select(PracticeSessionQuestion.question_id)
+                    .where(PracticeSessionQuestion.session_id == req.practice_session_id)
+                )
+                ps_q_ids = {str(r[0]) for r in ps_q_result.all()}
+            except (OperationalError, InterfaceError) as e:
+                logger.error(f"[test/submit] DB 不可用（校验归属）: {e}", exc_info=True)
+                raise HTTPException(status_code=503, detail="数据库不可用，请稍后重试")
+        if not set(q_ids).issubset(ps_q_ids):
+            raise HTTPException(status_code=422, detail="提交的题目不属于该练习会话")
+
+    return questions, practice_session_obj, derived_file_path
+
+
+# ---- M4.3 拆分函数 2：幂等检查 ----
+
+async def check_idempotency(
+    session,
+    user_id: str,
+    submission_id: str,
+    request_hash: str,
+) -> Optional[Tuple[Optional[EvaluationResult], Optional[LearningRecord]]]:
+    """幂等检查：若同一 (user_id, submission_id) 已存在，按 request_hash 校验一致性后从快照恢复。"""
+    result = await session.execute(
+        select(TestSession).where(
+            TestSession.user_id == user_id,
+            TestSession.client_submission_id == submission_id,
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if not existing:
+        return None
+    if existing.request_hash != request_hash:
+        raise HTTPException(status_code=409, detail="submission_id 已存在但请求内容不一致")
+    # 从快照恢复
+    evaluation = EvaluationResult(**existing.evaluation_snapshot) if existing.evaluation_snapshot else None
+    learning_record = LearningRecord(**existing.learning_record_snapshot) if existing.learning_record_snapshot else None
+    return evaluation, learning_record
+
+
+# ---- M3.1 拆分函数 3：评判（事务外，纯计算）----
+
+async def evaluate_submission(
+    questions: dict,
+    answer_map: List[Tuple[AnswerItem, dict]],
+    derived_file_path: Optional[str],
+) -> Tuple[EvaluationResult, List[dict], dict]:
+    """并发 LLM 评判 + 加载知识点关联 + 逐题诊断 + 聚合 errorTags + 生成 summary。
+
+    事务外纯计算。
+    返回：(evaluation_result, diagnosis_drafts, enriched_evals_map)
+    - evaluation_result: EvaluationResult Pydantic model
+    - diagnosis_drafts: 诊断草稿列表（纯 dict，含 questionId/error_category/...）
+    - enriched_evals_map: 供 persist 使用的 enriched_evals，按 questionId 索引
+    """
+    diagnosis_service = get_diagnosis_service()
 
     # ========== Step 2: 并发评判 ==========
     eval_tasks = []
-    answer_map = []
-    for ans in req.answers:
-        q = questions.get(ans.question_id)
-        if not q:
-            continue
-        answer_map.append((ans, q))
-        if used_db:
-            q_type = q.get("type", "text")
-            if q_type == "code":
-                eval_tasks.append(
-                    evaluate_code_answer(
-                        question=q["content"],
-                        user_code=ans.user_answer,
-                        question_id=ans.question_id,
-                    )
+    for ans, q in answer_map:
+        q_type = q.get("type", "text")
+        if q_type == "code":
+            eval_tasks.append(
+                evaluate_code_answer(
+                    question=q["content"],
+                    user_code=ans.user_answer,
+                    question_id=ans.question_id,
                 )
-            else:
-                eval_tasks.append(
-                    evaluate_single(
-                        question=q["content"],
-                        answer=q.get("expected_answer", ""),
-                        user_answer=ans.user_answer,
-                    )
-                )
+            )
         else:
-            eval_tasks.append(None)
+            eval_tasks.append(
+                evaluate_single(
+                    question=q["content"],
+                    answer=q.get("expected_answer", ""),
+                    user_answer=ans.user_answer,
+                )
+            )
 
     if not eval_tasks:
         raise HTTPException(status_code=400, detail="没有可评判的题目")
 
     logger.info(f"[test/submit] evaluating {len(eval_tasks)} questions")
     t0 = datetime.utcnow()
-
-    eval_results = []
-    if used_db:
-        eval_results = await asyncio.gather(*eval_tasks, return_exceptions=True)
-    else:
-        for (ans, q) in answer_map:
-            eval_results.append(_score_by_rules(q, ans.user_answer))
-
+    eval_results = await asyncio.gather(*eval_tasks, return_exceptions=True)
     elapsed = (datetime.utcnow() - t0).total_seconds()
-    logger.info(f"[test/submit] evaluation done in {elapsed:.1f}s (mode: {'LLM' if used_db else 'rules'})")
+    logger.info(f"[test/submit] evaluation done in {elapsed:.1f}s (mode: LLM)")
 
-    # ========== Step 3: 加载知识点关联（DB 模式下） ==========
+    # ========== Step 3: 加载知识点关联 ==========
     question_kps = {}
-    if used_db:
-        try:
-            async with async_session_factory() as session:
-                q_ids = [str(q["id"]) for q in questions.values()]
-                question_kps = await _load_question_knowledge_links(session, q_ids)
-        except Exception as e:
-            logger.warning(f"[test/submit] load knowledge links failed: {e}")
+    try:
+        async with async_session_factory() as session:
+            q_ids = [str(q["id"]) for q in questions.values()]
+            question_kps = await _load_question_knowledge_links(session, q_ids)
+    except Exception as e:
+        logger.warning(f"[test/submit] load knowledge links failed: {e}")
 
     # ========== Step 4: 逐题诊断 + 构建结果 ==========
     details = []
     scores = []
     enriched_evals = []
     diagnoses = []
+    enriched_evals_map = {}
 
     for i, (ans, q) in enumerate(answer_map):
         raw = eval_results[i] if i < len(eval_results) else None
@@ -394,6 +393,17 @@ async def submit_test(
             },
         })
 
+        # 供 persist 使用：含完整信息
+        enriched_evals_map[ans.question_id] = {
+            "correct": correct,
+            "score": score,
+            "error_type": result_dict.get("error_type"),
+            "error_tags": result_dict.get("error_tags", []),
+            "explanation": result_dict.get("explanation", ""),
+            "answer_text": ans.user_answer,
+            "question": q,
+        }
+
         # ---- 能力诊断 ----
         # 评判服务不可用时，跳过诊断（避免将系统故障误判为用户答错）
         is_eval_unavailable = result_dict.get("error_type") in ("评判失败", "评判异常")
@@ -417,183 +427,6 @@ async def submit_test(
     # file_path 优先使用从练习会话反查得到的 derived_file_path
     error_tags = aggregate_error_tags(enriched_evals, derived_file_path)
 
-    # ========== Step 6: 持久化 + 更新掌握度 + 生成复习任务（DB 模式） ==========
-    session_id = None
-    mastery_updates = {}
-    review_tasks = []
-    weak_points = []
-    persist_error = None
-
-    if used_db:
-        try:
-            async with async_session_factory() as session:
-                # 6.1 创建测试会话
-                test_session = TestSession(
-                    user_id=current_user.user_id,
-                    title=f"Test-{datetime.utcnow().strftime('%Y%m%d-%H%M')}",
-                    mode=req.mode or "learn",
-                    total_questions=len(eval_tasks),
-                    completed_questions=len(req.answers),
-                    score=round(sum(scores) / len(scores), 1) if scores else 0,
-                    status="completed",
-                    completed_at=datetime.utcnow(),
-                )
-                session.add(test_session)
-                await session.flush()
-                session_id = str(test_session.id)
-
-                # 6.1.1 若关联了练习会话，标记为已完成并回写得分
-                if req.practice_session_id:
-                    ps_result = await session.execute(
-                        select(PracticeSession).where(
-                            PracticeSession.id == req.practice_session_id,
-                            PracticeSession.user_id == current_user.user_id,
-                        )
-                    )
-                    ps_obj = ps_result.scalar_one_or_none()
-                    if ps_obj:
-                        ps_obj.status = "completed"
-                        ps_obj.score = round(sum(scores) / len(scores), 1) if scores else 0
-                        ps_obj.completed_at = datetime.utcnow()
-
-                # 6.2 保存每道题的作答记录
-                answer_records = {}
-                for i, (ans, q) in enumerate(answer_map):
-                    raw = eval_results[i] if i < len(eval_results) else None
-                    result_dict = raw if not isinstance(raw, Exception) and raw else {}
-                    correct = result_dict.get("correct", False) if not isinstance(raw, Exception) else False
-
-                    answer_record = TestAnswer(
-                        session_id=test_session.id,
-                        question_id=q.get("id"),
-                        answer_text=ans.user_answer,
-                        is_correct=correct,
-                        score=result_dict.get("score", 0),
-                        error_type=result_dict.get("error_type"),
-                        feedback=result_dict.get("explanation", ""),
-                        error_tags=result_dict.get("error_tags", []),
-                    )
-                    session.add(answer_record)
-                    answer_records[ans.question_id] = answer_record
-
-                await session.flush()
-
-                # 6.3 保存诊断记录，并建立 question_id -> diagnosis_id 映射
-                diagnosis_ids = {}
-                for diag in diagnoses:
-                    qid = diag["questionId"]
-                    answer_record = answer_records.get(qid)
-                    answer_id = str(answer_record.id) if answer_record else None
-
-                    diag_record = Diagnosis(
-                        answer_id=answer_id,
-                        question_id=qid,
-                        error_category=diag.get("error_category"),
-                        error_conclusion=diag.get("error_conclusion"),
-                        knowledge_point_ids=diag.get("knowledge_point_ids"),
-                        evidence_chunk_ids=diag.get("evidence_chunk_ids"),
-                        mastery_delta=diag.get("mastery_delta"),
-                        review_suggestions=diag.get("review_suggestions"),
-                    )
-                    session.add(diag_record)
-                    await session.flush()
-                    diagnosis_ids[qid] = str(diag_record.id)
-
-                await session.flush()
-
-                # 6.4 更新用户掌握度（逐题逐知识点，不是整场聚合）
-                # 关键：每道题单独更新，正确的题加分+增加streak，错误的题扣分+重置streak
-                # 评判不可用（error_type=="评判失败"）时跳过，不写入掌握度
-                mastery_updates = {}
-                for diag in diagnoses:
-                    qid = diag["questionId"]
-                    answer_record = answer_records.get(qid)
-                    if not answer_record:
-                        continue
-
-                    mastery_delta = diag.get("mastery_delta", {})
-                    if not mastery_delta:
-                        continue
-
-                    # 评判服务不可用时，不更新掌握度（避免误判为答错）
-                    if diag.get("_eval_unavailable"):
-                        logger.warning(f"[test/submit] skipping mastery update for qid={qid}: evaluator unavailable")
-                        continue
-
-                    # 本题的诊断结果
-                    is_correct = answer_record.is_correct
-                    error_category = diag.get("error_category")
-                    error_pattern_id = diag.get("error_pattern_id")
-
-                    # 逐知识点应用掌握度变化（每道题单独计算，不是整场）
-                    per_q_updates = await mastery_service.apply_mastery_delta(
-                        db=session,
-                        user_id=current_user.user_id,
-                        mastery_delta=mastery_delta,
-                        is_correct=is_correct,
-                        answer_id=str(answer_record.id),
-                        question_id=qid,
-                        error_category=error_category,
-                        error_pattern_id=error_pattern_id,
-                    )
-
-                    # 合并到总结果（同一知识点被多道题更新时，取最后一次）
-                    for kp_id, update in per_q_updates.items():
-                        mastery_updates[kp_id] = update
-
-                # 6.5 生成复习任务
-                # 注意：先获取 evidence_chunks，再生成任务
-                all_weak_kp_ids = set()
-                for diag in diagnoses:
-                    for kp_id in diag.get("weak_kp_ids", []):
-                        all_weak_kp_ids.add(str(kp_id))
-
-                evidence_map = {}
-                if all_weak_kp_ids:
-                    evidence_map = await mastery_service.get_evidence_chunks_for_kps(
-                        db=session,
-                        kp_ids=list(all_weak_kp_ids),
-                        limit_per_kp=3,
-                    )
-
-                for diag in diagnoses:
-                    if diag.get("error_category") and not diag.get("_eval_unavailable"):
-                        question_id = diag.get("questionId")
-                        diagnosis_id = diagnosis_ids.get(question_id)
-
-                        # 将 evidence_chunks 信息传入 diagnosis
-                        diag_evidence = {}
-                        for kp_id in diag.get("weak_kp_ids", []):
-                            chunks = evidence_map.get(str(kp_id), [])
-                            if chunks:
-                                diag_evidence[str(kp_id)] = chunks
-                        if diag_evidence:
-                            diag["evidence_chunks"] = diag_evidence
-
-                        tasks = await mastery_service.create_review_tasks_from_diagnosis(
-                            db=session,
-                            user_id=current_user.user_id,
-                            diagnosis=diag,
-                            diagnosis_id=diagnosis_id,
-                            question_id=question_id,
-                            evidence_map=evidence_map,
-                        )
-                        review_tasks.extend(tasks)
-
-                # 6.6 获取薄弱知识点
-                weak_points = await mastery_service.get_weak_points(
-                    db=session,
-                    user_id=current_user.user_id,
-                    limit=5,
-                )
-
-                await session.commit()
-                logger.info(f"[test/submit] persisted session={session_id}")
-
-        except Exception as e:
-            logger.error(f"[test/submit] persist error: {e}", exc_info=True)
-            persist_error = str(e)
-
     # ========== Step 7: 生成 summary ==========
     avg_score = sum(scores) / len(scores) if scores else 0
     wrong_count = sum(1 for e in enriched_evals if not e["correct"])
@@ -609,22 +442,358 @@ async def submit_test(
         top_tags = [et["tag"] for et in error_tags[:3]]
         summary += f" 薄弱知识点：{'、'.join(top_tags)}。"
 
-    # ========== Step 8: 构建响应 ==========
-    response = {
-        "score": round(avg_score, 1),
-        "summary": summary,
-        "details": details,
-        "errorTags": error_tags,
-        "sessionId": session_id,
-        "diagnoses": diagnoses,
-        "masteryUpdates": mastery_updates,
-        "reviewTasks": review_tasks,
-        "weakPoints": weak_points,
-        "persistenceStatus": "failed" if persist_error else "ok",
-        "persistenceMessage": persist_error or "学习记录已保存",
+    evaluation_result = EvaluationResult(
+        score=round(avg_score, 1),
+        summary=summary,
+        details=[DetailItem(**d) for d in details],
+        errorTags=[
+            ErrorTag(
+                tag=et.get("tag"),
+                count=et.get("count", 0),
+                sections=et.get("sections") or [],
+            )
+            for et in error_tags
+        ],
+    )
+
+    return evaluation_result, diagnoses, enriched_evals_map
+
+
+# ---- M3.1 + M4.4 拆分函数 4：持久化学习档案（短事务，只 flush）----
+
+async def persist_learning_record(
+    session,
+    user_id: str,
+    evaluation: EvaluationResult,
+    diagnosis_drafts: List[dict],
+    enriched_evals_map: dict,
+    req: SubmitRequest,
+    practice_session_obj: Optional[PracticeSession],
+    submission_id: str,
+    request_hash: str,
+) -> LearningRecord:
+    """在已开启的事务内写入 TestSession / TestAnswer / Diagnosis / UserMastery /
+    MasteryEvent / ReviewTask / 更新 PracticeSession。
+
+    只 flush，不 commit（由 session.begin() 上下文管理）。
+    返回：LearningRecord（纯数据 DTO，从已 flush 的 ORM 对象重新序列化）。
+    """
+    mastery_service = get_mastery_service()
+
+    # 6.1 创建测试会话
+    test_session = TestSession(
+        user_id=user_id,
+        title=f"Test-{datetime.utcnow().strftime('%Y%m%d-%H%M')}",
+        mode=req.mode or "learn",
+        total_questions=len(req.answers),
+        completed_questions=len(req.answers),
+        score=evaluation.score,
+        status="completed",
+        completed_at=datetime.utcnow(),
+        client_submission_id=submission_id,
+        request_hash=request_hash,
+        evaluation_snapshot=evaluation.model_dump(),
+    )
+    session.add(test_session)
+    await session.flush()
+    session_id = str(test_session.id)
+
+    # 6.1.1 若关联了练习会话，标记为已完成并回写得分
+    if practice_session_obj is not None:
+        ps_result = await session.execute(
+            select(PracticeSession).where(
+                PracticeSession.id == req.practice_session_id,
+                PracticeSession.user_id == user_id,
+            )
+        )
+        ps_obj = ps_result.scalar_one_or_none()
+        if ps_obj:
+            ps_obj.status = "completed"
+            ps_obj.score = evaluation.score
+            ps_obj.completed_at = datetime.utcnow()
+
+    # 6.2 保存每道题的作答记录
+    answer_records = {}
+    for ans in req.answers:
+        ev = enriched_evals_map.get(ans.question_id, {})
+        answer_record = TestAnswer(
+            session_id=test_session.id,
+            question_id=ans.question_id,
+            answer_text=ans.user_answer,
+            is_correct=ev.get("correct", False),
+            score=ev.get("score", 0),
+            error_type=ev.get("error_type"),
+            feedback=ev.get("explanation", ""),
+            error_tags=ev.get("error_tags", []),
+        )
+        session.add(answer_record)
+        answer_records[ans.question_id] = answer_record
+
+    await session.flush()
+
+    # 6.3 保存诊断记录，并建立 question_id -> diagnosis_id 映射
+    diagnosis_ids = {}
+    for diag in diagnosis_drafts:
+        qid = diag.get("questionId")
+        answer_record = answer_records.get(qid)
+        answer_id = str(answer_record.id) if answer_record else None
+
+        diag_record = Diagnosis(
+            answer_id=answer_id,
+            question_id=qid,
+            error_category=diag.get("error_category"),
+            error_conclusion=diag.get("error_conclusion"),
+            knowledge_point_ids=diag.get("knowledge_point_ids"),
+            evidence_chunk_ids=diag.get("evidence_chunk_ids"),
+            mastery_delta=diag.get("mastery_delta"),
+            review_suggestions=diag.get("review_suggestions"),
+        )
+        session.add(diag_record)
+        await session.flush()
+        diagnosis_ids[qid] = str(diag_record.id)
+
+    await session.flush()
+
+    # 6.4 更新用户掌握度（逐题逐知识点，不是整场聚合）
+    mastery_updates = {}
+    for diag in diagnosis_drafts:
+        qid = diag.get("questionId")
+        answer_record = answer_records.get(qid)
+        if not answer_record:
+            continue
+
+        mastery_delta = diag.get("mastery_delta", {})
+        if not mastery_delta:
+            continue
+
+        # 评判服务不可用时，不更新掌握度（避免误判为答错）
+        if diag.get("_eval_unavailable"):
+            logger.warning(f"[test/submit] skipping mastery update for qid={qid}: evaluator unavailable")
+            continue
+
+        is_correct = answer_record.is_correct
+        error_category = diag.get("error_category")
+        error_pattern_id = diag.get("error_pattern_id")
+
+        per_q_updates = await mastery_service.apply_mastery_delta(
+            db=session,
+            user_id=user_id,
+            mastery_delta=mastery_delta,
+            is_correct=is_correct,
+            answer_id=str(answer_record.id),
+            question_id=qid,
+            error_category=error_category,
+            error_pattern_id=error_pattern_id,
+        )
+
+        for kp_id, update in per_q_updates.items():
+            mastery_updates[kp_id] = update
+
+    # 6.5 生成复习任务
+    all_weak_kp_ids = set()
+    for diag in diagnosis_drafts:
+        for kp_id in diag.get("weak_kp_ids", []):
+            all_weak_kp_ids.add(str(kp_id))
+
+    evidence_map = {}
+    if all_weak_kp_ids:
+        evidence_map = await mastery_service.get_evidence_chunks_for_kps(
+            db=session,
+            kp_ids=list(all_weak_kp_ids),
+            limit_per_kp=3,
+        )
+
+    review_tasks = []
+    for diag in diagnosis_drafts:
+        if diag.get("error_category") and not diag.get("_eval_unavailable"):
+            question_id = diag.get("questionId")
+            diagnosis_id = diagnosis_ids.get(question_id)
+
+            # 将 evidence_chunks 信息传入 diagnosis
+            diag_evidence = {}
+            for kp_id in diag.get("weak_kp_ids", []):
+                chunks = evidence_map.get(str(kp_id), [])
+                if chunks:
+                    diag_evidence[str(kp_id)] = chunks
+            if diag_evidence:
+                diag["evidence_chunks"] = diag_evidence
+
+            tasks = await mastery_service.create_review_tasks_from_diagnosis(
+                db=session,
+                user_id=user_id,
+                diagnosis=diag,
+                diagnosis_id=diagnosis_id,
+                question_id=question_id,
+                evidence_map=evidence_map,
+            )
+            review_tasks.extend(tasks)
+
+    # 6.6 获取薄弱知识点
+    weak_points = await mastery_service.get_weak_points(
+        db=session,
+        user_id=user_id,
+        limit=5,
+    )
+
+    # 构建 LearningRecord（从已 flush 的 ORM 对象重新序列化）
+    learning_record = LearningRecord(
+        sessionId=session_id,
+        diagnoses=list(diagnosis_drafts),
+        masteryUpdates=mastery_updates,
+        reviewTasks=review_tasks,
+        weakPoints=weak_points,
+    )
+
+    # 回填 learning_record_snapshot（所有表 flush 后）
+    test_session.learning_record_snapshot = learning_record.model_dump()
+    await session.flush()
+
+    logger.info(f"[test/submit] persisted session={session_id}")
+    return learning_record
+
+
+# ---- 响应构建函数 ----
+
+def build_committed_response(submission_id, evaluation, learning_record):
+    return {
+        "submissionId": submission_id,
+        "commitStatus": "committed",
+        "retryable": False,
+        "message": "学习记录已保存",
+        "evaluation": evaluation.model_dump() if isinstance(evaluation, EvaluationResult) else evaluation,
+        "learningRecord": learning_record.model_dump() if isinstance(learning_record, LearningRecord) else learning_record,
     }
 
-    return response
+
+def build_not_committed_response(submission_id, evaluation, msg=None):
+    return {
+        "submissionId": submission_id,
+        "commitStatus": "not_committed",
+        "retryable": True,
+        "message": msg or "本次答案已完成即时评判，但学习记录未保存。请重新提交后再查看学习计划。",
+        "evaluation": evaluation.model_dump() if isinstance(evaluation, EvaluationResult) else evaluation,
+        "learningRecord": None,
+    }
+
+
+def build_outcome_unknown_response(submission_id, evaluation):
+    return {
+        "submissionId": submission_id,
+        "commitStatus": "outcome_unknown",
+        "retryable": False,
+        "message": "提交结果暂时无法确认，请点击“查询提交状态”确认学习记录是否已保存。",
+        "evaluation": evaluation.model_dump() if isinstance(evaluation, EvaluationResult) else evaluation,
+        "learningRecord": None,
+    }
+
+
+# ---- Routes ----
+
+@router.post("/submit")
+async def submit_test(
+    req: SubmitRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """
+    提交测试答案，返回完整学习闭环结果（四态提交协议）。
+
+    四态：
+    - committed        : 学习档案已成功持久化
+    - not_committed    : 评判完成但持久化失败（可重试）
+    - outcome_unknown  : 持久化阶段连接异常，无法确认是否已提交
+    - tracking_disabled: （仅 demo 路由使用）
+
+    支持幂等：前端生成 submission_id，重复提交同内容直接回放快照，
+    内容不一致返回 409。
+    """
+    submission_id = req.submission_id or str(uuid.uuid4())
+    request_hash = compute_request_hash(req)
+
+    # Step A: 加载题目 + 严格校验（失败抛 404/422/503，不返回 evaluation）
+    questions, ps_obj, derived_file_path = await load_submission_questions(req, current_user)
+
+    # Step B: 幂等检查（评判之前，避免重复消耗 LLM）
+    if req.submission_id:
+        async with async_session_factory() as check_session:
+            existing = await check_idempotency(check_session, current_user.user_id, submission_id, request_hash)
+            if existing is not None:
+                eval_snap, lr_snap = existing
+                return build_committed_response(submission_id, eval_snap, lr_snap)
+
+    # Step C: 评判（事务外，纯计算）
+    evaluation, diagnosis_drafts, enriched_evals_map = await evaluate_submission(
+        questions,
+        [(a, questions[a.question_id]) for a in req.answers if a.question_id in questions],
+        derived_file_path,
+    )
+
+    # Step D: 持久化（短事务）
+    try:
+        learning_record = None
+        async with async_session_factory() as session:
+            try:
+                async with session.begin():
+                    learning_record = await persist_learning_record(
+                        session, current_user.user_id, evaluation, diagnosis_drafts,
+                        enriched_evals_map, req, ps_obj, submission_id, request_hash,
+                    )
+            except HTTPException:
+                raise
+            except IntegrityError as exc:
+                raise ConcurrentSubmissionError() from exc
+            except (OperationalError, InterfaceError) as exc:
+                raise CommitUnknownError(str(exc)) from exc
+            except Exception as exc:
+                raise RetryablePersistenceError(str(exc)) from exc
+
+        return build_committed_response(submission_id, evaluation, learning_record)
+
+    except ConcurrentSubmissionError:
+        # 并发重复提交：回查已存在的记录，命中则回放快照
+        async with async_session_factory() as query_session:
+            record = await check_idempotency(query_session, current_user.user_id, submission_id, request_hash)
+            if record is not None:
+                return build_committed_response(submission_id, record[0], record[1])
+        return JSONResponse(status_code=503, content=build_not_committed_response(submission_id, evaluation))
+
+    except CommitUnknownError as exc:
+        logger.error(f"[test/submit] commit unknown: {exc}", exc_info=True)
+        return JSONResponse(status_code=503, content=build_outcome_unknown_response(submission_id, evaluation))
+
+    except RetryablePersistenceError as exc:
+        logger.error(f"[test/submit] persist failed: {exc}", exc_info=True)
+        return JSONResponse(status_code=503, content=build_not_committed_response(submission_id, evaluation, str(exc)))
+
+
+@router.get("/submissions/{submission_id}")
+async def get_submission_status(
+    submission_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """查询提交状态，用于 outcome_unknown 恢复与刷新后对账。"""
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(TestSession).where(
+                TestSession.user_id == current_user.user_id,
+                TestSession.client_submission_id == submission_id,
+            )
+        )
+        existing = result.scalar_one_or_none()
+        if not existing:
+            return {
+                "submissionId": submission_id,
+                "found": False,
+                "commitStatus": "not_committed",
+                "evaluation": None,
+                "learningRecord": None,
+            }
+        return {
+            "submissionId": submission_id,
+            "found": True,
+            "commitStatus": "committed",
+            "evaluation": existing.evaluation_snapshot,
+            "learningRecord": existing.learning_record_snapshot,
+        }
 
 
 @router.get("/sessions")

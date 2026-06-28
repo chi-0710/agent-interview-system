@@ -1,6 +1,12 @@
-import React, { useState, useEffect } from 'react';
-import { ArrowRight, Code, Check, X, Loader2, Brain, Target, BookOpen, RefreshCw } from 'lucide-react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { ArrowRight, Code, Check, X, Loader2, Brain, Target, BookOpen, RefreshCw, AlertTriangle, Search } from 'lucide-react';
 import useAppStore from '../../store/useAppStore';
+import { generateSubmissionId } from '../../utils/uuid';
+import {
+  stashSubmission,
+  getStashedSubmission,
+  clearStashedSubmission,
+} from '../../utils/submissionStash';
 
 /**
  * TestMode —— 测试模式考试界面
@@ -26,6 +32,8 @@ export default function TestMode() {
   const [error, setError] = useState(null);
   // 练习会话 ID（由 /api/learning/next-session 生成），提交测试时携带，用于学习闭环
   const [practiceSessionId, setPracticeSessionId] = useState(null);
+  // 幂等提交键:首次提交生成,失败重试复用,成功后清理
+  const [submissionId, setSubmissionId] = useState(null);
 
   // 加载题目：优先使用自适应练习会话，无知识点数据时回退到按文件加载
   useEffect(() => {
@@ -99,15 +107,31 @@ export default function TestMode() {
     setSubmitted(true);
     setSubmitting(true);
 
-    try {
-      const submitAnswers = questions.map((q) => ({
-        question_id: q.id,
-        user_answer: answers[q.id] || '',
-      }));
+    // 幂等键:首次提交生成,失败重试复用,成功后清理
+    let currentSubmissionId = submissionId;
+    if (!currentSubmissionId) {
+      currentSubmissionId = generateSubmissionId();
+      setSubmissionId(currentSubmissionId);
+    }
 
+    const submitAnswers = questions.map((q) => ({
+      question_id: q.id,
+      user_answer: answers[q.id] || '',
+    }));
+
+    // 暂存到 sessionStorage,防止刷新丢失导致重复提交
+    stashSubmission({
+      submissionId: currentSubmissionId,
+      answers: submitAnswers,
+      practiceSessionId,
+    });
+
+    try {
       // 约束：测试接口以 practice_session_id + answers 作为输入
-      // 有练习会话时携带 practice_session_id，否则回退 file_path（向后兼容）
-      const payload = { answers: submitAnswers };
+      const payload = {
+        answers: submitAnswers,
+        submission_id: currentSubmissionId,
+      };
       if (practiceSessionId) {
         payload.practice_session_id = practiceSessionId;
       } else if (activeFile?.path) {
@@ -120,40 +144,105 @@ export default function TestMode() {
         body: JSON.stringify(payload),
       });
 
+      // 关键:先解析 JSON,再判断状态码。503 响应体含即时评判,不能直接 throw。
+      const data = await resp.json().catch(() => null);
+
       if (!resp.ok) {
-        const errText = await resp.text().catch(() => '');
-        throw new Error(errText || `HTTP ${resp.status}`);
+        const isBusinessSubmissionState =
+          data?.commitStatus === 'not_committed' ||
+          data?.commitStatus === 'outcome_unknown';
+
+        if (!isBusinessSubmissionState) {
+          // 真正的异常(4xx/5xx 且非提交状态),抛错走错误分支
+          throw new Error(data?.detail || `HTTP ${resp.status}`);
+        }
+        // not_committed / outcome_unknown:继续走 setFeedback 展示即时评判
       }
 
-      const data = await resp.json();
       setFeedback(data);
 
-      // 设置错题标签 → 触发热力图
-      if (data.errorTags && data.errorTags.length > 0) {
-        setErrorTags(data.errorTags);
+      // 仅 committed 时才更新全局学习状态(强一致性:学习档案必须已落库)
+      if (data.commitStatus === 'committed') {
+        setErrorTags(data.evaluation?.errorTags || []);
+        if (data.learningRecord) {
+          setDiagnoses(data.learningRecord.diagnoses || []);
+          setMasteryUpdates(data.learningRecord.masteryUpdates || {});
+          setReviewTasks(data.learningRecord.reviewTasks || []);
+          setWeakPoints(data.learningRecord.weakPoints || []);
+        }
+        openRightDrawer();
+        // 提交成功,清理 sessionStorage 暂存
+        clearStashedSubmission();
       }
-
-      // 保存学习闭环数据到 store（仅持久化成功时）
-      if (data.persistenceStatus !== 'failed') {
-        if (data.diagnoses) setDiagnoses(data.diagnoses);
-        if (data.masteryUpdates) setMasteryUpdates(data.masteryUpdates);
-        if (data.reviewTasks) setReviewTasks(data.reviewTasks);
-        if (data.weakPoints) setWeakPoints(data.weakPoints);
-      }
-
-      // 打开右侧抽屉展示结果
-      openRightDrawer();
+      // persistence_failed / outcome_unknown / tracking_disabled:
+      // 不写 store、不更新热力图、不打开抽屉
     } catch (err) {
       setFeedback({
-        score: 0,
-        summary: `评判失败：${err.message}`,
-        details: [],
-        errorTags: [],
+        submissionId: currentSubmissionId,
+        commitStatus: 'not_committed',
+        retryable: true,
+        message: `评判失败:${err.message}`,
+        evaluation: {
+          score: 0,
+          summary: `评判失败:${err.message}`,
+          details: [],
+          errorTags: [],
+        },
+        learningRecord: null,
       });
     } finally {
       setSubmitting(false);
     }
   };
+
+  // 查询提交状态(outcome_unknown 恢复 + 刷新后对账)
+  const handleQuerySubmissionStatus = useCallback(async (sid) => {
+    try {
+      const resp = await fetch(`/api/test/submissions/${sid}`);
+      const status = await resp.json();
+      if (status.found) {
+        // 已提交成功,用快照恢复
+        setFeedback({
+          submissionId: status.submissionId,
+          commitStatus: 'committed',
+          retryable: false,
+          message: '已确认学习记录保存成功',
+          evaluation: status.evaluation,
+          learningRecord: status.learningRecord,
+        });
+        setErrorTags(status.evaluation?.errorTags || []);
+        if (status.learningRecord) {
+          setDiagnoses(status.learningRecord.diagnoses || []);
+          setMasteryUpdates(status.learningRecord.masteryUpdates || {});
+          setReviewTasks(status.learningRecord.reviewTasks || []);
+          setWeakPoints(status.learningRecord.weakPoints || []);
+        }
+        openRightDrawer();
+        clearStashedSubmission();
+      } else {
+        // 确认未提交,可安全重试
+        setFeedback((prev) => ({
+          ...prev,
+          commitStatus: 'not_committed',
+          message: '已确认上次提交未保存,可重新提交。',
+        }));
+      }
+    } catch (e) {
+      console.error('[TestMode] query submission status failed:', e);
+    }
+  }, [setDiagnoses, setMasteryUpdates, setReviewTasks, setWeakPoints, setErrorTags, openRightDrawer]);
+
+  // 挂载时检查 sessionStorage 是否有未确认的提交(刷新恢复)
+  useEffect(() => {
+    if (!activeFile) return;
+    const stashed = getStashedSubmission();
+    if (stashed && stashed.submissionId) {
+      setSubmissionId(stashed.submissionId);
+      // 自动查询提交状态
+      handleQuerySubmissionStatus(stashed.submissionId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeFile]);
 
   const handleBackToLearn = () => {
     setViewMode('learn');
@@ -224,75 +313,128 @@ export default function TestMode() {
 
   // ---- 已提交，显示结果摘要 ----
   if (submitted && feedback) {
-    const hasDiagnoses = feedback.diagnoses && feedback.diagnoses.length > 0;
-    const hasReviewTasks = feedback.reviewTasks && feedback.reviewTasks.length > 0;
-    const hasMasteryUpdates = feedback.masteryUpdates && Object.keys(feedback.masteryUpdates).length > 0;
-    const hasWeakPoints = feedback.weakPoints && feedback.weakPoints.length > 0;
+    // 嵌套结构:evaluation 始终存在(评判层);learningRecord 仅 committed 时非空(学习档案层)
+    const evaluation = feedback?.evaluation;
+    const learningRecord =
+      feedback?.commitStatus === 'committed' ? feedback.learningRecord : null;
+    const commitStatus = feedback?.commitStatus;
+
+    const hasDiagnoses = learningRecord?.diagnoses?.length > 0;
+    const hasReviewTasks = learningRecord?.reviewTasks?.length > 0;
+    const hasMasteryUpdates =
+      learningRecord?.masteryUpdates &&
+      Object.keys(learningRecord.masteryUpdates).length > 0;
+    const hasWeakPoints = learningRecord?.weakPoints?.length > 0;
 
     return (
       <div className="max-w-2xl mx-auto py-10 px-6">
         <div className="text-center mb-8">
           <div className="inline-flex items-center justify-center w-20 h-20 rounded-full bg-primary-50 dark:bg-primary-950 mb-4">
             <span className="text-3xl font-bold text-primary-600 dark:text-primary-400">
-              {feedback.score}
+              {evaluation?.score ?? 0}
             </span>
           </div>
           <h2 className="text-2xl font-bold text-surface-900 dark:text-surface-100 mb-2">测试完成</h2>
-          <p className="text-surface-500 dark:text-surface-400">{feedback.summary}</p>
+          <p className="text-surface-500 dark:text-surface-400">{evaluation?.summary}</p>
 
-          {feedback.persistenceStatus === 'failed' && (
+          {/* 四态警告框:committed 不显示;其他三态分别渲染对应恢复路径 */}
+          {commitStatus === 'not_committed' && (
             <div className="mt-4 p-3 bg-amber-50 dark:bg-amber-950 border border-amber-300 dark:border-amber-800 rounded-lg text-left" role="alert">
-              <p className="text-amber-800 dark:text-amber-200 text-sm font-medium">⚠️ 学习记录未保存</p>
-              <p className="text-amber-700 dark:text-amber-300 text-xs mt-1">
-                {feedback.persistenceMessage || '本次答案已完成评判，但学习记录暂未保存。请稍后重试。'}
+              <div className="flex items-start gap-2">
+                <AlertTriangle size={18} className="text-amber-600 dark:text-amber-400 mt-0.5 flex-shrink-0" />
+                <div className="flex-1">
+                  <p className="text-amber-800 dark:text-amber-200 text-sm font-medium">学习记录未保存</p>
+                  <p className="text-amber-700 dark:text-amber-300 text-xs mt-1">
+                    {feedback.message || '本次答案已完成评判，但学习记录未保存。请重新提交后再查看学习计划。'}
+                  </p>
+                  <button
+                    onClick={handleSubmit}
+                    className="mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs rounded-md font-medium transition-colors"
+                  >
+                    <RefreshCw size={14} />
+                    重新提交并保存
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {commitStatus === 'outcome_unknown' && (
+            <div className="mt-4 p-3 bg-blue-50 dark:bg-blue-950 border border-blue-300 dark:border-blue-800 rounded-lg text-left" role="alert">
+              <div className="flex items-start gap-2">
+                <AlertTriangle size={18} className="text-blue-600 dark:text-blue-400 mt-0.5 flex-shrink-0" />
+                <div className="flex-1">
+                  <p className="text-blue-800 dark:text-blue-200 text-sm font-medium">提交结果暂时无法确认</p>
+                  <p className="text-blue-700 dark:text-blue-300 text-xs mt-1">
+                    {feedback.message || '提交结果暂时无法确认，请点击"查询提交状态"确认学习记录是否已保存。'}
+                  </p>
+                  <button
+                    onClick={() => handleQuerySubmissionStatus(feedback.submissionId)}
+                    className="mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs rounded-md font-medium transition-colors"
+                  >
+                    <Search size={14} />
+                    查询提交状态
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {commitStatus === 'tracking_disabled' && (
+            <div className="mt-4 p-3 bg-gray-50 dark:bg-gray-900 border border-gray-300 dark:border-gray-700 rounded-lg text-left">
+              <p className="text-gray-700 dark:text-gray-300 text-sm font-medium">演示练习</p>
+              <p className="text-gray-600 dark:text-gray-400 text-xs mt-1">
+                {feedback.message || '演示练习，不保存学习档案。'}
               </p>
             </div>
           )}
         </div>
 
-        {/* 答题详情 */}
-        <div className="space-y-4 mb-8">
-          <h3 className="text-lg font-semibold text-surface-800 dark:text-surface-200 flex items-center gap-2">
-            <Check size={18} className="text-primary-500" />
-            答题详情
-          </h3>
-          {feedback.details.map((d, i) => (
-            <div
-              key={d.questionId}
-              className={`test-card border-l-4 ${
-                d.correct ? 'border-l-green-500' : 'border-l-red-500'
-              }`}
-            >
-              <div className="flex items-start gap-3">
-                {d.correct ? (
-                  <Check size={20} className="text-green-500 mt-0.5 flex-shrink-0" />
-                ) : (
-                  <X size={20} className="text-red-500 mt-0.5 flex-shrink-0" />
-                )}
-                <div className="flex-1 min-w-0">
-                  <p className="font-medium text-surface-800 dark:text-surface-200 mb-1">
-                    题目 {i + 1}
-                  </p>
-                  {!d.correct && d.errorType && (
-                    <span className="inline-block text-xs bg-red-50 dark:bg-red-950 text-red-600 dark:text-red-400 px-2 py-0.5 rounded-full mb-2">
-                      {d.errorType}
-                    </span>
+        {/* 答题详情(任何状态都展示,用户不白答) */}
+        {evaluation?.details?.length > 0 && (
+          <div className="space-y-4 mb-8">
+            <h3 className="text-lg font-semibold text-surface-800 dark:text-surface-200 flex items-center gap-2">
+              <Check size={18} className="text-primary-500" />
+              答题详情
+            </h3>
+            {evaluation.details.map((d, i) => (
+              <div
+                key={d.questionId}
+                className={`test-card border-l-4 ${
+                  d.correct ? 'border-l-green-500' : 'border-l-red-500'
+                }`}
+              >
+                <div className="flex items-start gap-3">
+                  {d.correct ? (
+                    <Check size={20} className="text-green-500 mt-0.5 flex-shrink-0" />
+                  ) : (
+                    <X size={20} className="text-red-500 mt-0.5 flex-shrink-0" />
                   )}
-                  <p className="text-sm text-surface-600 dark:text-surface-400">{d.explanation}</p>
+                  <div className="flex-1 min-w-0">
+                    <p className="font-medium text-surface-800 dark:text-surface-200 mb-1">
+                      题目 {i + 1}
+                    </p>
+                    {!d.correct && d.errorType && (
+                      <span className="inline-block text-xs bg-red-50 dark:bg-red-950 text-red-600 dark:text-red-400 px-2 py-0.5 rounded-full mb-2">
+                        {d.errorType}
+                      </span>
+                    )}
+                    <p className="text-sm text-surface-600 dark:text-surface-400">{d.explanation}</p>
+                  </div>
                 </div>
               </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        )}
 
-        {/* 能力诊断 */}
+        {/* 能力诊断(仅 committed 且 learningRecord 非空时渲染) */}
         {hasDiagnoses && (
           <div className="space-y-4 mb-8">
             <h3 className="text-lg font-semibold text-surface-800 dark:text-surface-200 flex items-center gap-2">
               <Brain size={18} className="text-purple-500" />
               能力诊断
             </h3>
-            {feedback.diagnoses.map((diag, i) => (
+            {learningRecord.diagnoses.map((diag, i) => (
               diag.error_category && (
                 <div key={i} className="test-card border-l-4 border-l-purple-500">
                   <div className="mb-2">
@@ -322,7 +464,7 @@ export default function TestMode() {
           </div>
         )}
 
-        {/* 掌握度变化 */}
+        {/* 掌握度变化(仅 committed) */}
         {hasMasteryUpdates && (
           <div className="space-y-4 mb-8">
             <h3 className="text-lg font-semibold text-surface-800 dark:text-surface-200 flex items-center gap-2">
@@ -330,7 +472,7 @@ export default function TestMode() {
               掌握度变化
             </h3>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {Object.entries(feedback.masteryUpdates).slice(0, 4).map(([kpId, update]) => (
+              {Object.entries(learningRecord.masteryUpdates).slice(0, 4).map(([kpId, update]) => (
                 <div key={kpId} className="test-card">
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-sm font-medium text-surface-700 dark:text-surface-300">
@@ -369,7 +511,7 @@ export default function TestMode() {
           </div>
         )}
 
-        {/* 复习任务 */}
+        {/* 复习任务(仅 committed) */}
         {hasReviewTasks && (
           <div className="space-y-4 mb-8">
             <h3 className="text-lg font-semibold text-surface-800 dark:text-surface-200 flex items-center gap-2">
@@ -377,7 +519,7 @@ export default function TestMode() {
               复习任务
             </h3>
             <div className="space-y-2">
-              {feedback.reviewTasks.slice(0, 5).map((task, i) => (
+              {learningRecord.reviewTasks.slice(0, 5).map((task, i) => (
                 <div key={i} className="test-card flex items-start gap-3">
                   <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
                     task.task_type === 'review_material' ? 'bg-blue-50 text-blue-500 dark:bg-blue-950 dark:text-blue-400' :
@@ -403,7 +545,7 @@ export default function TestMode() {
           </div>
         )}
 
-        {/* 薄弱知识点 */}
+        {/* 薄弱知识点(仅 committed) */}
         {hasWeakPoints && (
           <div className="space-y-4 mb-8">
             <h3 className="text-lg font-semibold text-surface-800 dark:text-surface-200 flex items-center gap-2">
@@ -411,7 +553,7 @@ export default function TestMode() {
               当前薄弱知识点
             </h3>
             <div className="space-y-2">
-              {feedback.weakPoints.slice(0, 5).map((wp, i) => (
+              {learningRecord.weakPoints.slice(0, 5).map((wp, i) => (
                 <div key={i} className="test-card flex items-center justify-between">
                   <div>
                     <p className="text-sm font-medium text-surface-700 dark:text-surface-300">
@@ -435,15 +577,29 @@ export default function TestMode() {
           </div>
         )}
 
+        {/* 底部按钮区:按 commitStatus 调整 */}
         <div className="flex gap-3 justify-center">
-          <button
-            onClick={handleBackToLearn}
-            className="px-6 py-2.5 bg-primary-500 text-white rounded-lg hover:bg-primary-600
-                       transition-colors font-medium flex items-center gap-2"
-          >
-            返回学习（查看错题高亮）
-            <ArrowRight size={16} />
-          </button>
+          {commitStatus === 'committed' && (
+            <button
+              onClick={handleBackToLearn}
+              className="px-6 py-2.5 bg-primary-500 text-white rounded-lg hover:bg-primary-600
+                         transition-colors font-medium flex items-center gap-2"
+            >
+              返回学习（查看错题高亮）
+              <ArrowRight size={16} />
+            </button>
+          )}
+          {commitStatus === 'tracking_disabled' && (
+            <button
+              onClick={handleBackToLearn}
+              className="px-6 py-2.5 bg-surface-500 text-white rounded-lg hover:bg-surface-600
+                         transition-colors font-medium flex items-center gap-2"
+            >
+              返回学习
+              <ArrowRight size={16} />
+            </button>
+          )}
+          {/* not_committed / outcome_unknown 的恢复按钮已在上方警告框内,这里不重复 */}
         </div>
       </div>
     );

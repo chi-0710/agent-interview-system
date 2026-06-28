@@ -295,6 +295,12 @@ class TestSession(Base):
     started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     completed_at = Column(DateTime, nullable=True)
 
+    # 幂等提交字段(M4)
+    client_submission_id = Column(String(64), nullable=True, index=True)  # 前端生成,幂等键
+    request_hash = Column(String(64), nullable=True)        # 完整请求哈希,用于 409 冲突检测
+    evaluation_snapshot = Column(JSON, nullable=True)       # 即时评判快照,用于幂等回放
+    learning_record_snapshot = Column(JSON, nullable=True)  # 学习档案快照,用于幂等回放
+
     answers = relationship("TestAnswer", back_populates="session", cascade="all, delete-orphan")
 
 
