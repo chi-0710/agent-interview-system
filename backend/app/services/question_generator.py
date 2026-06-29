@@ -206,8 +206,13 @@ class QuestionGenerator:
         )
 
         # 4. 调用 LLM 生成
+        # structured_chat 期望 messages 列表,需将 prompt 包装为 user 消息
+        # structured_chat 内部会自动注入 system 消息(含 JSON schema 约束)
+        # max_tokens 按题目数估算: 每道题约需 400 tokens(题干+选项+解析),加 schema 描述缓冲
+        messages = [{"role": "user", "content": prompt}]
+        estimated_max_tokens = max(2000, count * 500)
         try:
-            result = await structured_chat(prompt, output_model)
+            result = await structured_chat(messages, output_model, max_tokens=estimated_max_tokens)
         except Exception as e:
             logger.error(f"[question_generator] LLM generation failed: {e}", exc_info=True)
             raise ValueError(f"题目生成失败: {e}")
@@ -286,7 +291,7 @@ class QuestionGenerator:
             )
             doc = doc_result.scalar_one_or_none()
             if doc:
-                kp_info = f"文档标题: {doc.title}\n分类: {doc.category or '无'}"
+                kp_info = f"文档标题: {doc.title}\n文件类型: {doc.file_type or '未指定'}"
 
                 # 加载文档前几个 chunk
                 chunks_result = await db.execute(
@@ -352,10 +357,13 @@ class QuestionGenerator:
             "type": question_type,
             "difficulty": question_data.difficulty,
             "tags": question_data.tags,
-            "owner_id": user_id,
             "created_at": now,
             "updated_at": now,
         }
+        # 仅 document 来源写 document_id（knowledge_point/knowledge_base 不写）
+        # 满足硬约束：Document test questions must be directly associated with document_id
+        if source_type == "document":
+            question_kwargs["document_id"] = source_id
 
         if question_type == "single":
             question_kwargs.update({

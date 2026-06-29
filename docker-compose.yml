@@ -53,6 +53,9 @@ services:
     container_name: interview-frontend
     environment:
       - VITE_API_PROXY_TARGET=http://backend:8000
+      # Windows/macOS Docker Desktop 文件同步不可靠,启用轮询确保 HMR 实时生效
+      - CHOKIDAR_USEPOLLING=true
+      - CHOKIDAR_INTERVAL=300
     ports:
       - "3000:3000"
     volumes:

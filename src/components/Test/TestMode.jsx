@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { ArrowRight, Code, Check, X, Loader2, Brain, Target, BookOpen, RefreshCw, AlertTriangle, Search } from 'lucide-react';
+import React, { useState, useEffect, useCallback } from 'react'; // trigger vite reload
+import { ArrowRight, Code, Check, X, Loader2, Brain, Target, BookOpen, RefreshCw, AlertTriangle, Search, Sparkles } from 'lucide-react';
 import useAppStore from '../../store/useAppStore';
 import { generateSubmissionId } from '../../utils/uuid';
 import {
@@ -34,9 +34,13 @@ export default function TestMode() {
   const [practiceSessionId, setPracticeSessionId] = useState(null);
   // 幂等提交键:首次提交生成,失败重试复用,成功后清理
   const [submissionId, setSubmissionId] = useState(null);
+  // 章节无测试时,触发 AI 生成后用于重载题目列表
+  const [reloadToken, setReloadToken] = useState(0);
+  const [generating, setGenerating] = useState(false);
+  const [genError, setGenError] = useState(null);
 
   // 加载题目：优先使用自适应练习会话，无知识点数据时回退到按文件加载
-  useEffect(() => {
+  const loadQuestions = useCallback(() => {
     if (!activeFile) {
       setQuestions([]);
       setLoading(false);
@@ -50,6 +54,7 @@ export default function TestMode() {
     setSubmitted(false);
     setFeedback(null);
     setPracticeSessionId(null);
+    setGenError(null);
 
     // 1. 尝试自适应出题（学习闭环主路径），按当前文档限定出题范围
     fetch('/api/learning/next-session', {
@@ -94,6 +99,39 @@ export default function TestMode() {
         setLoading(false);
       });
   }, [activeFile]);
+
+  useEffect(() => {
+    loadQuestions();
+  }, [loadQuestions, reloadToken]);
+
+  // 章节无测试时,一键 AI 生成本章测试
+  const handleGenerate = async () => {
+    if (!activeFile?.path || generating) return;
+    setGenerating(true);
+    setGenError(null);
+    try {
+      const resp = await fetch('/api/copilot/generate-questions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          file_path: activeFile.path,
+          question_type: 'single',
+          count: 5,
+          difficulty: 'medium',
+        }),
+      });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        throw new Error(data?.detail || `HTTP ${resp.status}`);
+      }
+      // 生成成功,触发重载(走 /api/learning/next-session 拿到完整字段)
+      setReloadToken((t) => t + 1);
+    } catch (err) {
+      setGenError(err.message);
+    } finally {
+      setGenerating(false);
+    }
+  };
 
   const [currentIdx, setCurrentIdx] = useState(0);
   const currentQ = questions[currentIdx];
@@ -289,12 +327,37 @@ export default function TestMode() {
     return (
       <div className="flex flex-col items-center justify-center h-full text-surface-400 dark:text-surface-500 gap-3">
         <p className="text-lg">该章节暂无测试题</p>
-        <button
-          onClick={handleBackToLearn}
-          className="text-primary-500 hover:text-primary-600 text-sm"
-        >
-          ← 返回学习模式
-        </button>
+        <p className="text-sm text-surface-500 dark:text-surface-400">
+          可由 AI 根据本章内容即时生成测试题
+        </p>
+        {genError && (
+          <p className="text-sm text-red-500 mt-1 max-w-md text-center">
+            生成失败：{genError}
+          </p>
+        )}
+        <div className="flex gap-3 mt-4">
+          <button
+            onClick={handleGenerate}
+            disabled={generating}
+            className="px-5 py-2 bg-primary-500 text-white rounded-lg hover:bg-primary-600
+                       disabled:opacity-50 disabled:cursor-not-allowed
+                       transition-colors text-sm font-medium flex items-center gap-2"
+          >
+            {generating ? (
+              <Loader2 size={14} className="animate-spin" />
+            ) : (
+              <Sparkles size={14} />
+            )}
+            {generating ? 'AI 生成中...' : '生成本章测试'}
+          </button>
+          <button
+            onClick={handleBackToLearn}
+            disabled={generating}
+            className="text-primary-500 hover:text-primary-600 text-sm disabled:opacity-50"
+          >
+            ← 返回学习模式
+          </button>
+        </div>
       </div>
     );
   }

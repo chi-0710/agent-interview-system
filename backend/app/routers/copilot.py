@@ -275,9 +275,10 @@ async def clear_session(session_id: str, current_user: CurrentUser = Depends(get
 # ---- AI 出题与评估 ----
 
 class GenerateQuestionsRequest(BaseModel):
-    source_type: str              # knowledge_point | document | knowledge_base
-    source_id: str
-    question_type: str = "single" # single | text | code
+    source_type: str = "document"               # knowledge_point | document | knowledge_base
+    source_id: Optional[str] = None             # 当传 file_path 时可为空
+    file_path: Optional[str] = None             # 新增：前端按文档路径生成时使用
+    question_type: str = "single"               # single | text | code
     difficulty: str = "medium"
     count: int = 5
 
@@ -292,21 +293,58 @@ async def generate_questions(
     req: GenerateQuestionsRequest,
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    """AI 生成题目并写入数据库"""
+    """AI 生成题目并写入数据库。
+
+    支持两种来源指定方式：
+    1. 直接传 source_id（knowledge_point/document/knowledge_base 的 UUID）
+    2. 传 file_path（仅 document 场景），由后端反查 document_id（带用户隔离）
+
+    二者至少传一个；file_path 优先。
+    """
     try:
+        # 参数校验：file_path 与 source_id 至少一个
+        if not req.file_path and not req.source_id:
+            raise HTTPException(status_code=422, detail="file_path 或 source_id 至少传一个")
+
+        source_type = req.source_type
+        source_id = req.source_id
+
+        # file_path 优先：反查 document_id（带用户隔离）
+        if req.file_path:
+            from sqlalchemy import select, or_
+            from app.models import Document
+            async with async_session_factory() as session:
+                doc_result = await session.execute(
+                    select(Document).where(
+                        Document.file_path == req.file_path,
+                        or_(
+                            Document.owner_id == current_user.user_id,
+                            Document.owner_id == "__shared__",
+                        ),
+                    )
+                )
+                doc = doc_result.scalar_one_or_none()
+                if not doc:
+                    raise HTTPException(status_code=404, detail=f"未找到文档: {req.file_path}")
+                source_type = "document"
+                source_id = str(doc.id)
+
+        # 调用生成器
         generator = get_question_generator()
         async with async_session_factory() as session:
             result = await generator.generate_questions(
                 db=session,
                 user_id=current_user.user_id,
-                source_type=req.source_type,
-                source_id=req.source_id,
+                source_type=source_type,
+                source_id=source_id,
                 question_type=req.question_type,
                 difficulty=req.difficulty,
                 count=req.count,
             )
             await session.commit()
             return result
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
